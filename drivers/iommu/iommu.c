@@ -207,16 +207,17 @@ static struct dev_iommu *dev_iommu_get(struct device *dev)
 static void dev_iommu_free(struct device *dev)
 {
 	struct dev_iommu *param = dev->iommu;
+	struct iommu_fwspec *fwspec = param->fwspec;
 
-	dev->iommu = NULL;
-	if (param->fwspec) {
-		fwnode_handle_put(param->fwspec->iommu_fwnode);
-		kfree(param->fwspec);
+	WRITE_ONCE(param->fwspec, NULL);
+	smp_rmb();
+	WRITE_ONCE(dev->iommu, NULL);
+	if (fwspec) {
+		fwnode_handle_put(fwspec->iommu_fwnode);
+		kfree(fwspec);
 	}
 	kfree(param);
 }
-
-DEFINE_MUTEX(iommu_probe_device_lock);
 
 static int __iommu_probe_device(struct device *dev, struct list_head *group_list)
 {
@@ -227,25 +228,9 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 
 	if (!ops)
 		return -ENODEV;
-	/*
-	 * Serialise to avoid races between IOMMU drivers registering in
-	 * parallel and/or the "replay" calls from ACPI/OF code via client
-	 * driver probe. Once the latter have been cleaned up we should
-	 * probably be able to use device_lock() here to minimise the scope,
-	 * but for now enforcing a simple global ordering is fine.
-	 */
-	lockdep_assert_held(&iommu_probe_device_lock);
 
-	/* Device is probed already if in a group */
-	if (dev->iommu_group) {
-		ret = 0;
-		goto out_unlock;
-	}
-
-	if (!dev_iommu_get(dev)) {
-		ret = -ENOMEM;
-		goto out_unlock;
-	}
+	if (!dev_iommu_get(dev))
+		return -ENOMEM;
 
 	if (!try_module_get(ops->owner)) {
 		ret = -EINVAL;
@@ -265,12 +250,10 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 		ret = PTR_ERR(group);
 		goto out_release;
 	}
+	iommu_group_put(group);
 
-	mutex_lock(&group->mutex);
 	if (group_list && !group->default_domain && list_empty(&group->entry))
 		list_add_tail(&group->entry, group_list);
-	mutex_unlock(&group->mutex);
-	iommu_group_put(group);
 
 	iommu_device_link(iommu_dev, dev);
 
@@ -285,7 +268,6 @@ out_module_put:
 err_free:
 	dev_iommu_free(dev);
 
-out_unlock:
 	return ret;
 }
 
@@ -295,9 +277,7 @@ int iommu_probe_device(struct device *dev)
 	struct iommu_group *group;
 	int ret;
 
-	mutex_lock(&iommu_probe_device_lock);
 	ret = __iommu_probe_device(dev, NULL);
-	mutex_unlock(&iommu_probe_device_lock);
 	if (ret)
 		goto err_out;
 
@@ -679,16 +659,12 @@ struct iommu_group *iommu_group_alloc(void)
 
 	ret = iommu_group_create_file(group,
 				      &iommu_group_attr_reserved_regions);
-	if (ret) {
-		kobject_put(group->devices_kobj);
+	if (ret)
 		return ERR_PTR(ret);
-	}
 
 	ret = iommu_group_create_file(group, &iommu_group_attr_type);
-	if (ret) {
-		kobject_put(group->devices_kobj);
+	if (ret)
 		return ERR_PTR(ret);
-	}
 
 	pr_debug("Allocated group %d\n", group->id);
 
@@ -1648,11 +1624,17 @@ struct iommu_domain *iommu_group_default_domain(struct iommu_group *group)
 static int probe_iommu_group(struct device *dev, void *data)
 {
 	struct list_head *group_list = data;
+	struct iommu_group *group;
 	int ret;
 
-	mutex_lock(&iommu_probe_device_lock);
+	/* Device is probed already if in a group */
+	group = iommu_group_get(dev);
+	if (group) {
+		iommu_group_put(group);
+		return 0;
+	}
+
 	ret = __iommu_probe_device(dev, group_list);
-	mutex_unlock(&iommu_probe_device_lock);
 	if (ret == -ENODEV)
 		ret = 0;
 
@@ -1751,9 +1733,6 @@ static void probe_alloc_default_domain(struct bus_type *bus,
 {
 	struct __group_domain_type gtype;
 
-	if (group->default_domain)
-		return;
-
 	memset(&gtype, 0, sizeof(gtype));
 
 	/* Ask for default domain requirements of all devices in the group */
@@ -1831,10 +1810,10 @@ int bus_iommu_probe(struct bus_type *bus)
 		return ret;
 
 	list_for_each_entry_safe(group, next, &group_list, entry) {
-		mutex_lock(&group->mutex);
-
 		/* Remove item from the list */
 		list_del_init(&group->entry);
+
+		mutex_lock(&group->mutex);
 
 		/* Try to allocate default domain */
 		probe_alloc_default_domain(bus, group);

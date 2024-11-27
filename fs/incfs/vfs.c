@@ -5,7 +5,6 @@
 
 #include <linux/blkdev.h>
 #include <linux/compat.h>
-#include <linux/delay.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/fs_stack.h>
@@ -121,28 +120,7 @@ static const struct address_space_operations incfs_address_space_ops = {
 
 static vm_fault_t incfs_fault(struct vm_fault *vmf)
 {
-	struct file *file = vmf->vma->vm_file;
-	struct data_file *df = get_incfs_data_file(file);
-	struct backing_file_context *bfc = df ? df->df_backing_file_context : NULL;
-
-	/*
-	 * This is something of a kludge
-	 * We want to retry if the read from the underlying file is interrupted,
-	 * but not if the read fails because the stored data is corrupt since the
-	 * latter causes an infinite loop.
-	 *
-	 * However, whether we wish to retry must be set before we call
-	 * filemap_fault, *and* there is no way of getting the read error code out
-	 * of filemap_fault.
-	 *
-	 * So unless there is a robust solution to both the above problems, we can
-	 * solve the actual issues we have encoutered by retrying unless there is
-	 * known corruption in the backing file. This does mean that we won't retry
-	 * with a corrupt backing file if a (good) read is interrupted, but we
-	 * don't really handle corruption well anyway at this time.
-	 */
-	if (bfc && bfc->bc_has_bad_block)
-		vmf->flags &= ~FAULT_FLAG_ALLOW_RETRY;
+	vmf->flags &= ~FAULT_FLAG_ALLOW_RETRY;
 	return filemap_fault(vmf);
 }
 
@@ -505,8 +483,7 @@ static struct dentry *open_or_create_special_dir(struct dentry *backing_dir,
 
 static int read_single_page_timeouts(struct data_file *df, struct file *f,
 				     int block_index, struct mem_range range,
-				     struct mem_range tmp,
-				     unsigned int *delayed_min_us)
+				     struct mem_range tmp)
 {
 	struct mount_info *mi = df->df_mount_info;
 	struct incfs_read_data_file_timeouts timeouts = {
@@ -538,23 +515,7 @@ static int read_single_page_timeouts(struct data_file *df, struct file *f,
 	}
 
 	return incfs_read_data_file_block(range, f, block_index, tmp,
-					  &timeouts, delayed_min_us);
-}
-
-static int usleep_interruptible(u32 us)
-{
-	/* See:
-	 * https://www.kernel.org/doc/Documentation/timers/timers-howto.txt
-	 * for explanation
-	 */
-	if (us < 10) {
-		udelay(us);
-		return 0;
-	} else if (us < 20000) {
-		usleep_range(us, us + us / 10);
-		return 0;
-	} else
-		return msleep_interruptible(us / 1000);
+					  &timeouts);
 }
 
 static int read_single_page(struct file *f, struct page *page)
@@ -567,7 +528,6 @@ static int read_single_page(struct file *f, struct page *page)
 	int result = 0;
 	void *page_start;
 	int block_index;
-	unsigned int delayed_min_us = 0;
 
 	if (!df) {
 		SetPageError(page);
@@ -593,8 +553,7 @@ static int read_single_page(struct file *f, struct page *page)
 		bytes_to_read = min_t(loff_t, size - offset, PAGE_SIZE);
 
 		read_result = read_single_page_timeouts(df, f, block_index,
-					range(page_start, bytes_to_read), tmp,
-					&delayed_min_us);
+					range(page_start, bytes_to_read), tmp);
 
 		free_pages((unsigned long)tmp.data, get_order(tmp.len));
 	} else {
@@ -608,13 +567,6 @@ err:
 	else if (read_result < PAGE_SIZE)
 		zero_user(page, read_result, PAGE_SIZE - read_result);
 
-	if (result == -EBADMSG) {
-		struct backing_file_context *bfc = df ? df->df_backing_file_context : NULL;
-
-		if (bfc)
-			bfc->bc_has_bad_block = 1;
-	}
-
 	if (result == 0)
 		SetPageUptodate(page);
 	else
@@ -623,8 +575,6 @@ err:
 	flush_dcache_page(page);
 	kunmap(page);
 	unlock_page(page);
-	if (delayed_min_us)
-		usleep_interruptible(delayed_min_us);
 	return result;
 }
 
@@ -718,7 +668,8 @@ out:
 	dput(file);
 }
 
-static void handle_file_completed(struct file *f, struct data_file *df)
+static void maybe_delete_incomplete_file(struct file *f,
+					 struct data_file *df)
 {
 	struct backing_file_context *bfc;
 	struct mount_info *mi = df->df_mount_info;
@@ -726,6 +677,9 @@ static void handle_file_completed(struct file *f, struct data_file *df)
 	struct dentry *incomplete_file_dentry = NULL;
 	const struct cred *old_cred = override_creds(mi->mi_owner);
 	int error;
+
+	if (atomic_read(&df->df_data_blocks_written) < df->df_data_block_count)
+		goto out;
 
 	/* Truncate file to remove any preallocated space */
 	bfc = df->df_backing_file_context;
@@ -785,7 +739,6 @@ static long ioctl_fill_blocks(struct file *f, void __user *arg)
 	u8 *data_buf = NULL;
 	ssize_t error = 0;
 	int i = 0;
-	bool complete = false;
 
 	if (!df)
 		return -EBADF;
@@ -827,7 +780,7 @@ static long ioctl_fill_blocks(struct file *f, void __user *arg)
 							     data_buf);
 		} else {
 			error = incfs_process_new_data_block(df, &fill_block,
-							data_buf, &complete);
+							     data_buf);
 		}
 		if (error)
 			break;
@@ -836,8 +789,7 @@ static long ioctl_fill_blocks(struct file *f, void __user *arg)
 	if (data_buf)
 		free_pages((unsigned long)data_buf, get_order(data_buf_size));
 
-	if (complete)
-		handle_file_completed(f, df);
+	maybe_delete_incomplete_file(f, df);
 
 	/*
 	 * Only report the error if no records were processed, otherwise
@@ -1656,10 +1608,6 @@ static int incfs_setattr(struct user_namespace *ns, struct dentry *dentry,
 	if (ia->ia_valid & ATTR_SIZE)
 		return -EINVAL;
 
-	if ((ia->ia_valid & (ATTR_KILL_SUID|ATTR_KILL_SGID)) &&
-	    (ia->ia_valid & ATTR_MODE))
-		return -EINVAL;
-
 	if (!di)
 		return -EINVAL;
 	backing_dentry = di->backing_path.dentry;
@@ -1973,13 +1921,6 @@ void incfs_kill_sb(struct super_block *sb)
 
 	pr_debug("incfs: unmount\n");
 
-	/*
-	 * We must kill the super before freeing mi, since killing the super
-	 * triggers inode eviction, which triggers the final update of the
-	 * backing file, which uses certain information for mi
-	 */
-	kill_anon_super(sb);
-
 	if (mi) {
 		if (mi->mi_backing_dir_path.dentry)
 			dinode = d_inode(mi->mi_backing_dir_path.dentry);
@@ -1997,6 +1938,7 @@ void incfs_kill_sb(struct super_block *sb)
 		incfs_free_mount_info(mi);
 		sb->s_fs_info = NULL;
 	}
+	kill_anon_super(sb);
 }
 
 static int show_options(struct seq_file *m, struct dentry *root)

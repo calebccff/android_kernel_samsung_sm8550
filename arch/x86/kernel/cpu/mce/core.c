@@ -44,7 +44,6 @@
 #include <linux/sync_core.h>
 #include <linux/task_work.h>
 #include <linux/hardirq.h>
-#include <linux/kexec.h>
 
 #include <asm/intel-family.h>
 #include <asm/processor.h>
@@ -177,26 +176,52 @@ void mce_unregister_decode_chain(struct notifier_block *nb)
 }
 EXPORT_SYMBOL_GPL(mce_unregister_decode_chain);
 
-u32 mca_msr_reg(int bank, enum mca_msr reg)
+static inline u32 ctl_reg(int bank)
 {
-	if (mce_flags.smca) {
-		switch (reg) {
-		case MCA_CTL:	 return MSR_AMD64_SMCA_MCx_CTL(bank);
-		case MCA_ADDR:	 return MSR_AMD64_SMCA_MCx_ADDR(bank);
-		case MCA_MISC:	 return MSR_AMD64_SMCA_MCx_MISC(bank);
-		case MCA_STATUS: return MSR_AMD64_SMCA_MCx_STATUS(bank);
-		}
-	}
-
-	switch (reg) {
-	case MCA_CTL:	 return MSR_IA32_MCx_CTL(bank);
-	case MCA_ADDR:	 return MSR_IA32_MCx_ADDR(bank);
-	case MCA_MISC:	 return MSR_IA32_MCx_MISC(bank);
-	case MCA_STATUS: return MSR_IA32_MCx_STATUS(bank);
-	}
-
-	return 0;
+	return MSR_IA32_MCx_CTL(bank);
 }
+
+static inline u32 status_reg(int bank)
+{
+	return MSR_IA32_MCx_STATUS(bank);
+}
+
+static inline u32 addr_reg(int bank)
+{
+	return MSR_IA32_MCx_ADDR(bank);
+}
+
+static inline u32 misc_reg(int bank)
+{
+	return MSR_IA32_MCx_MISC(bank);
+}
+
+static inline u32 smca_ctl_reg(int bank)
+{
+	return MSR_AMD64_SMCA_MCx_CTL(bank);
+}
+
+static inline u32 smca_status_reg(int bank)
+{
+	return MSR_AMD64_SMCA_MCx_STATUS(bank);
+}
+
+static inline u32 smca_addr_reg(int bank)
+{
+	return MSR_AMD64_SMCA_MCx_ADDR(bank);
+}
+
+static inline u32 smca_misc_reg(int bank)
+{
+	return MSR_AMD64_SMCA_MCx_MISC(bank);
+}
+
+struct mca_msr_regs msr_ops = {
+	.ctl	= ctl_reg,
+	.status	= status_reg,
+	.addr	= addr_reg,
+	.misc	= misc_reg
+};
 
 static void __print_mce(struct mce *m)
 {
@@ -275,7 +300,6 @@ static noinstr void mce_panic(const char *msg, struct mce *final, char *exp)
 	struct llist_node *pending;
 	struct mce_evt_llist *l;
 	int apei_err = 0;
-	struct page *p;
 
 	/*
 	 * Allow instrumentation around external facilities usage. Not that it
@@ -331,20 +355,6 @@ static noinstr void mce_panic(const char *msg, struct mce *final, char *exp)
 	if (!fake_panic) {
 		if (panic_timeout == 0)
 			panic_timeout = mca_cfg.panic_timeout;
-
-		/*
-		 * Kdump skips the poisoned page in order to avoid
-		 * touching the error bits again. Poison the page even
-		 * if the error is fatal and the machine is about to
-		 * panic.
-		 */
-		if (kexec_crash_loaded()) {
-			if (final && (final->status & MCI_STATUS_ADDRV)) {
-				p = pfn_to_online_page(final->addr >> PAGE_SHIFT);
-				if (p)
-					SetPageHWPoison(p);
-			}
-		}
 		panic(msg);
 	} else
 		pr_emerg(HW_ERR "Fake kernel panic: %s\n", msg);
@@ -361,27 +371,24 @@ static int msr_to_offset(u32 msr)
 
 	if (msr == mca_cfg.rip_msr)
 		return offsetof(struct mce, ip);
-	if (msr == mca_msr_reg(bank, MCA_STATUS))
+	if (msr == msr_ops.status(bank))
 		return offsetof(struct mce, status);
-	if (msr == mca_msr_reg(bank, MCA_ADDR))
+	if (msr == msr_ops.addr(bank))
 		return offsetof(struct mce, addr);
-	if (msr == mca_msr_reg(bank, MCA_MISC))
+	if (msr == msr_ops.misc(bank))
 		return offsetof(struct mce, misc);
 	if (msr == MSR_IA32_MCG_STATUS)
 		return offsetof(struct mce, mcgstatus);
 	return -1;
 }
 
-void ex_handler_msr_mce(struct pt_regs *regs, bool wrmsr)
+__visible bool ex_handler_rdmsr_fault(const struct exception_table_entry *fixup,
+				      struct pt_regs *regs, int trapnr,
+				      unsigned long error_code,
+				      unsigned long fault_addr)
 {
-	if (wrmsr) {
-		pr_emerg("MSR access error: WRMSR to 0x%x (tried to write 0x%08x%08x) at rIP: 0x%lx (%pS)\n",
-			 (unsigned int)regs->cx, (unsigned int)regs->dx, (unsigned int)regs->ax,
-			 regs->ip, (void *)regs->ip);
-	} else {
-		pr_emerg("MSR access error: RDMSR from 0x%x at rIP: 0x%lx (%pS)\n",
-			 (unsigned int)regs->cx, regs->ip, (void *)regs->ip);
-	}
+	pr_emerg("MSR access error: RDMSR from 0x%x at rIP: 0x%lx (%pS)\n",
+		 (unsigned int)regs->cx, regs->ip, (void *)regs->ip);
 
 	show_stack_regs(regs);
 
@@ -389,6 +396,8 @@ void ex_handler_msr_mce(struct pt_regs *regs, bool wrmsr)
 
 	while (true)
 		cpu_relax();
+
+	return true;
 }
 
 /* MSR access wrappers used for error injection */
@@ -420,11 +429,30 @@ static noinstr u64 mce_rdmsrl(u32 msr)
 	 */
 	asm volatile("1: rdmsr\n"
 		     "2:\n"
-		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_RDMSR_IN_MCE)
+		     _ASM_EXTABLE_HANDLE(1b, 2b, ex_handler_rdmsr_fault)
 		     : EAX_EDX_RET(val, low, high) : "c" (msr));
 
 
 	return EAX_EDX_VAL(val, low, high);
+}
+
+__visible bool ex_handler_wrmsr_fault(const struct exception_table_entry *fixup,
+				      struct pt_regs *regs, int trapnr,
+				      unsigned long error_code,
+				      unsigned long fault_addr)
+{
+	pr_emerg("MSR access error: WRMSR to 0x%x (tried to write 0x%08x%08x) at rIP: 0x%lx (%pS)\n",
+		 (unsigned int)regs->cx, (unsigned int)regs->dx, (unsigned int)regs->ax,
+		  regs->ip, (void *)regs->ip);
+
+	show_stack_regs(regs);
+
+	panic("MCA architectural violation!\n");
+
+	while (true)
+		cpu_relax();
+
+	return true;
 }
 
 static noinstr void mce_wrmsrl(u32 msr, u64 v)
@@ -451,7 +479,7 @@ static noinstr void mce_wrmsrl(u32 msr, u64 v)
 	/* See comment in mce_rdmsrl() */
 	asm volatile("1: wrmsr\n"
 		     "2:\n"
-		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_WRMSR_IN_MCE)
+		     _ASM_EXTABLE_HANDLE(1b, 2b, ex_handler_wrmsr_fault)
 		     : : "c" (msr), "a"(low), "d" (high) : "memory");
 }
 
@@ -666,10 +694,10 @@ static struct notifier_block mce_default_nb = {
 static noinstr void mce_read_aux(struct mce *m, int i)
 {
 	if (m->status & MCI_STATUS_MISCV)
-		m->misc = mce_rdmsrl(mca_msr_reg(i, MCA_MISC));
+		m->misc = mce_rdmsrl(msr_ops.misc(i));
 
 	if (m->status & MCI_STATUS_ADDRV) {
-		m->addr = mce_rdmsrl(mca_msr_reg(i, MCA_ADDR));
+		m->addr = mce_rdmsrl(msr_ops.addr(i));
 
 		/*
 		 * Mask the reported address by the reported granularity.
@@ -739,7 +767,7 @@ bool machine_check_poll(enum mcp_flags flags, mce_banks_t *b)
 		m.bank = i;
 
 		barrier();
-		m.status = mce_rdmsrl(mca_msr_reg(i, MCA_STATUS));
+		m.status = mce_rdmsrl(msr_ops.status(i));
 
 		/* If this entry is not valid, ignore it */
 		if (!(m.status & MCI_STATUS_VAL))
@@ -807,7 +835,7 @@ clear_it:
 		/*
 		 * Clear state for this bank.
 		 */
-		mce_wrmsrl(mca_msr_reg(i, MCA_STATUS), 0);
+		mce_wrmsrl(msr_ops.status(i), 0);
 	}
 
 	/*
@@ -832,7 +860,7 @@ static int mce_no_way_out(struct mce *m, char **msg, unsigned long *validp,
 	int i;
 
 	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
-		m->status = mce_rdmsrl(mca_msr_reg(i, MCA_STATUS));
+		m->status = mce_rdmsrl(msr_ops.status(i));
 		if (!(m->status & MCI_STATUS_VAL))
 			continue;
 
@@ -1133,7 +1161,7 @@ static void mce_clear_state(unsigned long *toclear)
 
 	for (i = 0; i < this_cpu_read(mce_num_banks); i++) {
 		if (test_bit(i, toclear))
-			mce_wrmsrl(mca_msr_reg(i, MCA_STATUS), 0);
+			mce_wrmsrl(msr_ops.status(i), 0);
 	}
 }
 
@@ -1192,7 +1220,7 @@ static void __mc_scan_banks(struct mce *m, struct pt_regs *regs, struct mce *fin
 		m->addr = 0;
 		m->bank = i;
 
-		m->status = mce_rdmsrl(mca_msr_reg(i, MCA_STATUS));
+		m->status = mce_rdmsrl(msr_ops.status(i));
 		if (!(m->status & MCI_STATUS_VAL))
 			continue;
 
@@ -1269,12 +1297,10 @@ static void kill_me_maybe(struct callback_head *cb)
 
 	/*
 	 * -EHWPOISON from memory_failure() means that it already sent SIGBUS
-	 * to the current process with the proper error info,
-	 * -EOPNOTSUPP means hwpoison_filter() filtered the error event,
-	 *
-	 * In both cases, no further processing is required.
+	 * to the current process with the proper error info, so no need to
+	 * send SIGBUS here again.
 	 */
-	if (ret == -EHWPOISON || ret == -EOPNOTSUPP)
+	if (ret == -EHWPOISON)
 		return;
 
 	if (p->mce_vaddr != (void __user *)-1l) {
@@ -1689,8 +1715,8 @@ static void __mcheck_cpu_init_clear_banks(void)
 
 		if (!b->init)
 			continue;
-		wrmsrl(mca_msr_reg(i, MCA_CTL), b->ctl);
-		wrmsrl(mca_msr_reg(i, MCA_STATUS), 0);
+		wrmsrl(msr_ops.ctl(i), b->ctl);
+		wrmsrl(msr_ops.status(i), 0);
 	}
 }
 
@@ -1716,7 +1742,7 @@ static void __mcheck_cpu_check_banks(void)
 		if (!b->init)
 			continue;
 
-		rdmsrl(mca_msr_reg(i, MCA_CTL), msrval);
+		rdmsrl(msr_ops.ctl(i), msrval);
 		b->init = !!msrval;
 	}
 }
@@ -1873,6 +1899,13 @@ static void __mcheck_cpu_init_early(struct cpuinfo_x86 *c)
 		mce_flags.succor	 = !!cpu_has(c, X86_FEATURE_SUCCOR);
 		mce_flags.smca		 = !!cpu_has(c, X86_FEATURE_SMCA);
 		mce_flags.amd_threshold	 = 1;
+
+		if (mce_flags.smca) {
+			msr_ops.ctl	= smca_ctl_reg;
+			msr_ops.status	= smca_status_reg;
+			msr_ops.addr	= smca_addr_reg;
+			msr_ops.misc	= smca_misc_reg;
+		}
 	}
 }
 
@@ -2248,7 +2281,7 @@ static void mce_disable_error_reporting(void)
 		struct mce_bank *b = &mce_banks[i];
 
 		if (b->init)
-			wrmsrl(mca_msr_reg(i, MCA_CTL), 0);
+			wrmsrl(msr_ops.ctl(i), 0);
 	}
 	return;
 }
@@ -2318,7 +2351,6 @@ static void mce_restart(void)
 {
 	mce_timer_delete_all();
 	on_each_cpu(mce_cpu_restart, NULL, 1);
-	mce_schedule_work();
 }
 
 /* Toggle features for corrected errors */
@@ -2601,7 +2633,7 @@ static void mce_reenable_cpu(void)
 		struct mce_bank *b = &mce_banks[i];
 
 		if (b->init)
-			wrmsrl(mca_msr_reg(i, MCA_CTL), b->ctl);
+			wrmsrl(msr_ops.ctl(i), b->ctl);
 	}
 }
 

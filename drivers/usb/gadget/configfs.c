@@ -16,7 +16,7 @@
 #include <linux/usb/ch9.h>
 
 #ifdef CONFIG_USB_CONFIGFS_F_ACC
-extern int acc_ctrlrequest_composite(struct usb_composite_dev *cdev,
+extern int acc_ctrlrequest(struct usb_composite_dev *cdev,
 				const struct usb_ctrlrequest *ctrl);
 void acc_disconnect(void);
 #endif
@@ -136,12 +136,9 @@ static int usb_string_copy(const char *s, char **s_copy)
 	int ret;
 	char *str;
 	char *copy = *s_copy;
-
 	ret = strlen(s);
 	if (ret > USB_MAX_STRING_LEN)
 		return -EOVERFLOW;
-	if (ret < 1)
-		return -EINVAL;
 
 	if (copy) {
 		str = copy;
@@ -451,9 +448,10 @@ static int config_usb_cfg_link(
 	struct usb_composite_dev *cdev = cfg->c.cdev;
 	struct gadget_info *gi = container_of(cdev, struct gadget_info, cdev);
 
-	struct usb_function_instance *fi =
-			to_usb_function_instance(usb_func_ci);
-	struct usb_function_instance *a_fi = NULL, *iter;
+	struct config_group *group = to_config_group(usb_func_ci);
+	struct usb_function_instance *fi = container_of(group,
+			struct usb_function_instance, group);
+	struct usb_function_instance *a_fi;
 	struct usb_function *f;
 	int ret;
 
@@ -463,19 +461,11 @@ static int config_usb_cfg_link(
 	 * from another gadget or a random directory.
 	 * Also a function instance can only be linked once.
 	 */
-
-	if (gi->composite.gadget_driver.udc_name) {
-		ret = -EINVAL;
-		goto out;
+	list_for_each_entry(a_fi, &gi->available_func, cfs_list) {
+		if (a_fi == fi)
+			break;
 	}
-
-	list_for_each_entry(iter, &gi->available_func, cfs_list) {
-		if (iter != fi)
-			continue;
-		a_fi = iter;
-		break;
-	}
-	if (!a_fi) {
+	if (a_fi != fi) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -509,8 +499,9 @@ static void config_usb_cfg_unlink(
 	struct usb_composite_dev *cdev = cfg->c.cdev;
 	struct gadget_info *gi = container_of(cdev, struct gadget_info, cdev);
 
-	struct usb_function_instance *fi =
-			to_usb_function_instance(usb_func_ci);
+	struct config_group *group = to_config_group(usb_func_ci);
+	struct usb_function_instance *fi = container_of(group,
+			struct usb_function_instance, group);
 	struct usb_function *f;
 
 	/*
@@ -931,18 +922,18 @@ static int os_desc_link(struct config_item *os_desc_ci,
 	struct gadget_info *gi = container_of(to_config_group(os_desc_ci),
 					struct gadget_info, os_desc_group);
 	struct usb_composite_dev *cdev = &gi->cdev;
-	struct config_usb_cfg *c_target = to_config_usb_cfg(usb_cfg_ci);
-	struct usb_configuration *c = NULL, *iter;
+	struct config_usb_cfg *c_target =
+		container_of(to_config_group(usb_cfg_ci),
+			     struct config_usb_cfg, group);
+	struct usb_configuration *c;
 	int ret;
 
 	mutex_lock(&gi->lock);
-	list_for_each_entry(iter, &cdev->configs, list) {
-		if (iter != &c_target->c)
-			continue;
-		c = iter;
-		break;
+	list_for_each_entry(c, &cdev->configs, list) {
+		if (c == &c_target->c)
+			break;
 	}
-	if (!c) {
+	if (c != &c_target->c) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -1571,14 +1562,11 @@ static int android_setup(struct usb_gadget *gadget,
 
 #ifdef CONFIG_USB_CONFIGFS_F_ACC
 	if (value < 0)
-		value = acc_ctrlrequest_composite(cdev, c);
+		value = acc_ctrlrequest(cdev, c);
 #endif
 
-	if (value < 0) {
-		spin_lock_irqsave(&gi->spinlock, flags);
+	if (value < 0)
 		value = composite_setup(gadget, c);
-		spin_unlock_irqrestore(&gi->spinlock, flags);
-	}
 
 	spin_lock_irqsave(&cdev->lock, flags);
 	if (c->bRequest == USB_REQ_SET_CONFIGURATION &&
@@ -1663,6 +1651,15 @@ static void configfs_composite_reset(struct usb_gadget *gadget)
 	if (!cdev)
 		return;
 
+#ifdef CONFIG_USB_CONFIGFS_F_ACC
+	/*
+	* accessory HID support can be active while the
+	* accessory function is not actually enabled,
+	* so we need to inform it when we are disconnected.
+	*/
+	acc_disconnect();
+#endif
+
 	gi = container_of(cdev, struct gadget_info, cdev);
 	spin_lock_irqsave(&gi->spinlock, flags);
 	cdev = get_gadget_data(gadget);
@@ -1670,6 +1667,11 @@ static void configfs_composite_reset(struct usb_gadget *gadget)
 		spin_unlock_irqrestore(&gi->spinlock, flags);
 		return;
 	}
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	gi->connected = 0;
+	schedule_work(&gi->work);
+#endif
 
 	composite_reset(gadget);
 	spin_unlock_irqrestore(&gi->spinlock, flags);

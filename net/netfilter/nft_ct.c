@@ -97,7 +97,7 @@ static void nft_ct_get_eval(const struct nft_expr *expr,
 		return;
 #ifdef CONFIG_NF_CONNTRACK_MARK
 	case NFT_CT_MARK:
-		*dest = READ_ONCE(ct->mark);
+		*dest = ct->mark;
 		return;
 #endif
 #ifdef CONFIG_NF_CONNTRACK_SECMARK
@@ -296,8 +296,8 @@ static void nft_ct_set_eval(const struct nft_expr *expr,
 	switch (priv->key) {
 #ifdef CONFIG_NF_CONNTRACK_MARK
 	case NFT_CT_MARK:
-		if (READ_ONCE(ct->mark) != value) {
-			WRITE_ONCE(ct->mark, value);
+		if (ct->mark != value) {
+			ct->mark = value;
 			nf_conntrack_event_cache(IPCT_MARK, ct);
 		}
 		break;
@@ -483,9 +483,6 @@ static int nft_ct_get_init(const struct nft_ctx *ctx,
 		break;
 #endif
 	case NFT_CT_ID:
-		if (tb[NFTA_CT_DIRECTION])
-			return -EINVAL;
-
 		len = sizeof(u32);
 		break;
 	default:
@@ -1189,31 +1186,7 @@ static int nft_ct_expect_obj_init(const struct nft_ctx *ctx,
 	if (tb[NFTA_CT_EXPECT_L3PROTO])
 		priv->l3num = ntohs(nla_get_be16(tb[NFTA_CT_EXPECT_L3PROTO]));
 
-	switch (priv->l3num) {
-	case NFPROTO_IPV4:
-	case NFPROTO_IPV6:
-		if (priv->l3num != ctx->family)
-			return -EINVAL;
-
-		fallthrough;
-	case NFPROTO_INET:
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
 	priv->l4proto = nla_get_u8(tb[NFTA_CT_EXPECT_L4PROTO]);
-	switch (priv->l4proto) {
-	case IPPROTO_TCP:
-	case IPPROTO_UDP:
-	case IPPROTO_UDPLITE:
-	case IPPROTO_DCCP:
-	case IPPROTO_SCTP:
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
 	priv->dport = nla_get_be16(tb[NFTA_CT_EXPECT_DPORT]);
 	priv->timeout = nla_get_u32(tb[NFTA_CT_EXPECT_TIMEOUT]);
 	priv->size = nla_get_u8(tb[NFTA_CT_EXPECT_SIZE]);

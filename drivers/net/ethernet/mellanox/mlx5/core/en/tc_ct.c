@@ -609,15 +609,22 @@ mlx5_tc_ct_entry_create_nat(struct mlx5_tc_ct_priv *ct_priv,
 	struct flow_action *flow_action = &flow_rule->action;
 	struct mlx5_core_dev *mdev = ct_priv->dev;
 	struct flow_action_entry *act;
+	size_t action_size;
 	char *modact;
 	int err, i;
+
+	action_size = MLX5_UN_SZ_BYTES(set_add_copy_action_in_auto);
 
 	flow_action_for_each(i, act, flow_action) {
 		switch (act->id) {
 		case FLOW_ACTION_MANGLE: {
-			modact = mlx5e_mod_hdr_alloc(mdev, ct_priv->ns_type, mod_acts);
-			if (IS_ERR(modact))
-				return PTR_ERR(modact);
+			err = alloc_mod_hdr_actions(mdev, ct_priv->ns_type,
+						    mod_acts);
+			if (err)
+				return err;
+
+			modact = mod_acts->actions +
+				 mod_acts->num_actions * action_size;
 
 			err = mlx5_tc_ct_parse_mangle_to_mod_act(act, modact);
 			if (err)
@@ -643,7 +650,7 @@ mlx5_tc_ct_entry_create_mod_hdr(struct mlx5_tc_ct_priv *ct_priv,
 				struct mlx5_flow_attr *attr,
 				struct flow_rule *flow_rule,
 				struct mlx5e_mod_hdr_handle **mh,
-				u8 zone_restore_id, bool nat_table, bool has_nat)
+				u8 zone_restore_id, bool nat)
 {
 	struct mlx5e_tc_mod_hdr_acts mod_acts = {};
 	struct flow_action_entry *meta;
@@ -658,12 +665,11 @@ mlx5_tc_ct_entry_create_mod_hdr(struct mlx5_tc_ct_priv *ct_priv,
 				     &attr->ct_attr.ct_labels_id);
 	if (err)
 		return -EOPNOTSUPP;
-	if (nat_table) {
-		if (has_nat) {
-			err = mlx5_tc_ct_entry_create_nat(ct_priv, flow_rule, &mod_acts);
-			if (err)
-				goto err_mapping;
-		}
+	if (nat) {
+		err = mlx5_tc_ct_entry_create_nat(ct_priv, flow_rule,
+						  &mod_acts);
+		if (err)
+			goto err_mapping;
 
 		ct_state |= MLX5_CT_STATE_NAT_BIT;
 	}
@@ -678,7 +684,7 @@ mlx5_tc_ct_entry_create_mod_hdr(struct mlx5_tc_ct_priv *ct_priv,
 	if (err)
 		goto err_mapping;
 
-	if (nat_table && has_nat) {
+	if (nat) {
 		attr->modify_hdr = mlx5_modify_header_alloc(ct_priv->dev, ct_priv->ns_type,
 							    mod_acts.num_actions,
 							    mod_acts.actions);
@@ -700,11 +706,11 @@ mlx5_tc_ct_entry_create_mod_hdr(struct mlx5_tc_ct_priv *ct_priv,
 		attr->modify_hdr = mlx5e_mod_hdr_get(*mh);
 	}
 
-	mlx5e_mod_hdr_dealloc(&mod_acts);
+	dealloc_mod_hdr_actions(&mod_acts);
 	return 0;
 
 err_mapping:
-	mlx5e_mod_hdr_dealloc(&mod_acts);
+	dealloc_mod_hdr_actions(&mod_acts);
 	mlx5_put_label_mapping(ct_priv, attr->ct_attr.ct_labels_id);
 	return err;
 }
@@ -746,9 +752,7 @@ mlx5_tc_ct_entry_add_rule(struct mlx5_tc_ct_priv *ct_priv,
 
 	err = mlx5_tc_ct_entry_create_mod_hdr(ct_priv, attr, flow_rule,
 					      &zone_rule->mh,
-					      zone_restore_id,
-					      nat,
-					      mlx5_tc_ct_entry_has_nat(entry));
+					      zone_restore_id, nat);
 	if (err) {
 		ct_dbg("Failed to create ct entry mod hdr");
 		goto err_mod_hdr;
@@ -1456,7 +1460,7 @@ static int tc_ct_pre_ct_add_rules(struct mlx5_ct_ft *ct_ft,
 	}
 	pre_ct->miss_rule = rule;
 
-	mlx5e_mod_hdr_dealloc(&pre_mod_acts);
+	dealloc_mod_hdr_actions(&pre_mod_acts);
 	kvfree(spec);
 	return 0;
 
@@ -1465,7 +1469,7 @@ err_miss_rule:
 err_flow_rule:
 	mlx5_modify_header_dealloc(dev, pre_ct->modify_hdr);
 err_mapping:
-	mlx5e_mod_hdr_dealloc(&pre_mod_acts);
+	dealloc_mod_hdr_actions(&pre_mod_acts);
 	kvfree(spec);
 	return err;
 }
@@ -1865,14 +1869,14 @@ __mlx5_tc_ct_flow_offload(struct mlx5_tc_ct_priv *ct_priv,
 	}
 
 	attr->ct_attr.ct_flow = ct_flow;
-	mlx5e_mod_hdr_dealloc(&pre_mod_acts);
+	dealloc_mod_hdr_actions(&pre_mod_acts);
 
 	return ct_flow->pre_ct_rule;
 
 err_insert_orig:
 	mlx5_modify_header_dealloc(priv->mdev, pre_ct_attr->modify_hdr);
 err_mapping:
-	mlx5e_mod_hdr_dealloc(&pre_mod_acts);
+	dealloc_mod_hdr_actions(&pre_mod_acts);
 	mlx5_chains_put_chain_mapping(ct_priv->chains, ct_flow->chain_mapping);
 err_get_chain:
 	kfree(ct_flow->pre_ct_attr);

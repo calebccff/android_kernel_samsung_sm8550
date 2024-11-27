@@ -293,7 +293,7 @@ static void __put_super(struct super_block *s)
 		WARN_ON(s->s_inode_lru.node);
 		WARN_ON(!list_empty(&s->s_mounts));
 		security_sb_free(s);
-		fscrypt_destroy_keyring(s);
+		fscrypt_sb_free(s);
 		put_user_ns(s->s_user_ns);
 		kfree(s->s_subtype);
 		call_rcu(&s->rcu, destroy_super_rcu);
@@ -450,21 +450,11 @@ void generic_shutdown_super(struct super_block *sb)
 
 		cgroup_writeback_umount();
 
-		/* Evict all inodes with zero refcount. */
+		/* evict all inodes with zero refcount */
 		evict_inodes(sb);
-
-		/*
-		 * Clean up and evict any inodes that still have references due
-		 * to fsnotify or the security policy.
-		 */
+		/* only nonzero refcount inodes can have marks */
 		fsnotify_sb_delete(sb);
 		security_sb_delete(sb);
-
-		/*
-		 * Now that all potentially-encrypted inodes have been evicted,
-		 * the fscrypt keyring can be destroyed.
-		 */
-		fscrypt_destroy_keyring(sb);
 
 		if (sb->s_dio_done_wq) {
 			destroy_workqueue(sb->s_dio_done_wq);
@@ -863,7 +853,6 @@ int reconfigure_super(struct fs_context *fc)
 	struct super_block *sb = fc->root->d_sb;
 	int retval;
 	bool remount_ro = false;
-	bool remount_rw = false;
 	bool force = fc->sb_flags & SB_FORCE;
 
 	if (fc->sb_flags_mask & ~MS_RMT_MASK)
@@ -881,7 +870,7 @@ int reconfigure_super(struct fs_context *fc)
 		    bdev_read_only(sb->s_bdev))
 			return -EACCES;
 #endif
-		remount_rw = !(fc->sb_flags & SB_RDONLY) && sb_rdonly(sb);
+
 		remount_ro = (fc->sb_flags & SB_RDONLY) && !sb_rdonly(sb);
 	}
 
@@ -911,14 +900,6 @@ int reconfigure_super(struct fs_context *fc)
 			if (retval)
 				return retval;
 		}
-	} else if (remount_rw) {
-		/*
-		 * We set s_readonly_remount here to protect filesystem's
-		 * reconfigure code from writes from userspace until
-		 * reconfigure finishes.
-		 */
-		sb->s_readonly_remount = 1;
-		smp_wmb();
 	}
 
 	if (fc->ops->reconfigure) {
@@ -932,8 +913,14 @@ int reconfigure_super(struct fs_context *fc)
 		}
 	}
 
+#ifdef CONFIG_FIVE
+	WRITE_ONCE(sb->s_flags, ((sb->s_flags & ~fc->sb_flags_mask) |
+				 (fc->sb_flags & fc->sb_flags_mask) |
+				 MS_I_VERSION));
+#else
 	WRITE_ONCE(sb->s_flags, ((sb->s_flags & ~fc->sb_flags_mask) |
 				 (fc->sb_flags & fc->sb_flags_mask)));
+#endif
 	/* Needs to be ordered wrt mnt_is_readonly() */
 	smp_wmb();
 	sb->s_readonly_remount = 0;
@@ -1438,7 +1425,7 @@ struct dentry *mount_nodev(struct file_system_type *fs_type,
 	s->s_flags |= SB_ACTIVE;
 	return dget(s->s_root);
 }
-EXPORT_SYMBOL_NS(mount_nodev, ANDROID_GKI_VFS_EXPORT_ONLY);
+EXPORT_SYMBOL(mount_nodev);
 
 int reconfigure_single(struct super_block *s,
 		       int flags, void *data)
@@ -1558,23 +1545,18 @@ int vfs_get_tree(struct fs_context *fc)
 }
 EXPORT_SYMBOL(vfs_get_tree);
 
-/*
- * Setup private BDI for given superblock. It gets automatically cleaned up
- * in generic_shutdown_super().
- */
-int super_setup_bdi_name(struct super_block *sb, char *fmt, ...)
+static int __super_setup_bdi_name(struct super_block *sb,
+		struct backing_dev_info *(*bdi_alloc_func)(int),
+		char *fmt, va_list args)
 {
 	struct backing_dev_info *bdi;
 	int err;
-	va_list args;
 
-	bdi = bdi_alloc(NUMA_NO_NODE);
+	bdi = bdi_alloc_func(NUMA_NO_NODE);
 	if (!bdi)
 		return -ENOMEM;
 
-	va_start(args, fmt);
 	err = bdi_register_va(bdi, fmt, args);
-	va_end(args);
 	if (err) {
 		bdi_put(bdi);
 		return err;
@@ -1584,7 +1566,40 @@ int super_setup_bdi_name(struct super_block *sb, char *fmt, ...)
 
 	return 0;
 }
+
+/*
+ * Setup private BDI for given superblock. It gets automatically cleaned up
+ * in generic_shutdown_super().
+ */
+int super_setup_bdi_name(struct super_block *sb, char *fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, fmt);
+	ret =  __super_setup_bdi_name(sb, bdi_alloc, fmt, args);
+	va_end(args);
+
+	return ret;
+}
 EXPORT_SYMBOL(super_setup_bdi_name);
+
+/*
+ * Setup private SEC_BDI for given superblock. It gets automatically cleaned up
+ * in generic_shutdown_super().
+ */
+int sec_super_setup_bdi_name(struct super_block *sb, char *fmt, ...)
+{
+	va_list args;
+	int ret;
+
+	va_start(args, fmt);
+	ret =  __super_setup_bdi_name(sb, sec_bdi_alloc, fmt, args);
+	va_end(args);
+
+	return ret;
+}
+EXPORT_SYMBOL(sec_super_setup_bdi_name);
 
 /*
  * Setup private BDI for given superblock. I gets automatically cleaned up

@@ -68,9 +68,7 @@ struct dm_crypt_io {
 	struct crypt_config *cc;
 	struct bio *base_bio;
 	u8 *integrity_metadata;
-	bool integrity_metadata_from_pool:1;
-	bool in_tasklet:1;
-
+	bool integrity_metadata_from_pool;
 	struct work_struct work;
 	struct tasklet_struct tasklet;
 
@@ -1672,7 +1670,6 @@ retry:
 		goto out;
 
 	clone_init(io, clone);
-	clone->bi_ioprio = io->base_bio->bi_ioprio;
 
 	remaining_size = size;
 
@@ -1726,7 +1723,6 @@ static void crypt_io_init(struct dm_crypt_io *io, struct crypt_config *cc,
 	io->ctx.r.req = NULL;
 	io->integrity_metadata = NULL;
 	io->integrity_metadata_from_pool = false;
-	io->in_tasklet = false;
 	atomic_set(&io->io_pending, 0);
 }
 
@@ -1772,13 +1768,14 @@ static void crypt_dec_pending(struct dm_crypt_io *io)
 	 * our tasklet. In this case we need to delay bio_endio()
 	 * execution to after the tasklet is done and dequeued.
 	 */
-	if (io->in_tasklet) {
-		INIT_WORK(&io->work, kcryptd_io_bio_endio);
-		queue_work(cc->io_queue, &io->work);
+	if (tasklet_trylock(&io->tasklet)) {
+		tasklet_unlock(&io->tasklet);
+		bio_endio(base_bio);
 		return;
 	}
 
-	bio_endio(base_bio);
+	INIT_WORK(&io->work, kcryptd_io_bio_endio);
+	queue_work(cc->io_queue, &io->work);
 }
 
 /*
@@ -1938,7 +1935,6 @@ pop_from_list:
 			io = crypt_io_from_node(rb_first(&write_tree));
 			rb_erase(&io->rb_node, &write_tree);
 			kcryptd_io_write(io);
-			cond_resched();
 		} while (!RB_EMPTY_ROOT(&write_tree));
 		blk_finish_plug(&plug);
 	}
@@ -2065,12 +2061,6 @@ static void kcryptd_crypt_write_convert(struct dm_crypt_io *io)
 
 	io->ctx.bio_out = clone;
 	io->ctx.iter_out = clone->bi_iter;
-
-	if (crypt_integrity_aead(cc)) {
-		bio_copy_data(clone, io->base_bio);
-		io->ctx.bio_in = clone;
-		io->ctx.iter_in = clone->bi_iter;
-	}
 
 	sector += bio_sectors(clone);
 
@@ -2238,7 +2228,6 @@ static void kcryptd_queue_crypt(struct dm_crypt_io *io)
 		 * it is being executed with irqs disabled.
 		 */
 		if (in_hardirq() || irqs_disabled()) {
-			io->in_tasklet = true;
 			tasklet_init(&io->tasklet, kcryptd_crypt_tasklet, (unsigned long)&io->work);
 			tasklet_schedule(&io->tasklet);
 			return;
@@ -3446,11 +3435,6 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	return DM_MAPIO_SUBMITTED;
 }
 
-static char hex2asc(unsigned char c)
-{
-	return c + '0' + ((unsigned)(9 - c) >> 4 & 0x27);
-}
-
 static void crypt_status(struct dm_target *ti, status_type_t type,
 			 unsigned status_flags, char *result, unsigned maxlen)
 {
@@ -3469,12 +3453,9 @@ static void crypt_status(struct dm_target *ti, status_type_t type,
 		if (cc->key_size > 0) {
 			if (cc->key_string)
 				DMEMIT(":%u:%s", cc->key_size, cc->key_string);
-			else {
-				for (i = 0; i < cc->key_size; i++) {
-					DMEMIT("%c%c", hex2asc(cc->key[i] >> 4),
-					       hex2asc(cc->key[i] & 0xf));
-				}
-			}
+			else
+				for (i = 0; i < cc->key_size; i++)
+					DMEMIT("%02x", cc->key[i]);
 		} else
 			DMEMIT("-");
 

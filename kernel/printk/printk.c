@@ -744,19 +744,8 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
 			goto out;
 		}
 
-		/*
-		 * Guarantee this task is visible on the waitqueue before
-		 * checking the wake condition.
-		 *
-		 * The full memory barrier within set_current_state() of
-		 * prepare_to_wait_event() pairs with the full memory barrier
-		 * within wq_has_sleeper().
-		 *
-		 * This pairs with __wake_up_klogd:A.
-		 */
 		ret = wait_event_interruptible(log_wait,
-				prb_read_valid(prb,
-					atomic64_read(&user->seq), r)); /* LMM(devkmsg_read:A) */
+				prb_read_valid(prb, atomic64_read(&user->seq), r));
 		if (ret)
 			goto out;
 	}
@@ -869,7 +858,7 @@ static int devkmsg_open(struct inode *inode, struct file *file)
 			return err;
 	}
 
-	user = kmalloc(sizeof(struct devkmsg_user), GFP_KERNEL);
+	user = kvmalloc(sizeof(struct devkmsg_user), GFP_KERNEL);
 	if (!user)
 		return -ENOMEM;
 
@@ -897,7 +886,7 @@ static int devkmsg_release(struct inode *inode, struct file *file)
 	ratelimit_state_exit(&user->rs);
 
 	mutex_destroy(&user->lock);
-	kfree(user);
+	kvfree(user);
 	return 0;
 }
 
@@ -1525,18 +1514,7 @@ static int syslog_print(char __user *buf, int size)
 		seq = syslog_seq;
 
 		mutex_unlock(&syslog_lock);
-		/*
-		 * Guarantee this task is visible on the waitqueue before
-		 * checking the wake condition.
-		 *
-		 * The full memory barrier within set_current_state() of
-		 * prepare_to_wait_event() pairs with the full memory barrier
-		 * within wq_has_sleeper().
-		 *
-		 * This pairs with __wake_up_klogd:A.
-		 */
-		len = wait_event_interruptible(log_wait,
-				prb_read_valid(prb, seq, NULL)); /* LMM(syslog_print:A) */
+		len = wait_event_interruptible(log_wait, prb_read_valid(prb, seq, NULL));
 		mutex_lock(&syslog_lock);
 
 		if (len)
@@ -2289,11 +2267,7 @@ asmlinkage int vprintk_emit(int facility, int level,
 		preempt_enable();
 	}
 
-	if (in_sched)
-		defer_console_output();
-	else
-		wake_up_klogd();
-
+	wake_up_klogd();
 	return printed_len;
 }
 EXPORT_SYMBOL(vprintk_emit);
@@ -3267,7 +3241,7 @@ static DEFINE_PER_CPU(int, printk_pending);
 
 static void wake_up_klogd_work_func(struct irq_work *irq_work)
 {
-	int pending = this_cpu_xchg(printk_pending, 0);
+	int pending = __this_cpu_xchg(printk_pending, 0);
 
 	if (pending & PRINTK_PENDING_OUTPUT) {
 		/* If trylock fails, someone else is doing the printing */
@@ -3282,65 +3256,28 @@ static void wake_up_klogd_work_func(struct irq_work *irq_work)
 static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) =
 	IRQ_WORK_INIT_LAZY(wake_up_klogd_work_func);
 
-static void __wake_up_klogd(int val)
+void wake_up_klogd(void)
 {
 	if (!printk_percpu_data_ready())
 		return;
 
 	preempt_disable();
-	/*
-	 * Guarantee any new records can be seen by tasks preparing to wait
-	 * before this context checks if the wait queue is empty.
-	 *
-	 * The full memory barrier within wq_has_sleeper() pairs with the full
-	 * memory barrier within set_current_state() of
-	 * prepare_to_wait_event(), which is called after ___wait_event() adds
-	 * the waiter but before it has checked the wait condition.
-	 *
-	 * This pairs with devkmsg_read:A and syslog_print:A.
-	 */
-	if (wq_has_sleeper(&log_wait) || /* LMM(__wake_up_klogd:A) */
-	    (val & PRINTK_PENDING_OUTPUT)) {
-		this_cpu_or(printk_pending, val);
+	if (waitqueue_active(&log_wait)) {
+		this_cpu_or(printk_pending, PRINTK_PENDING_WAKEUP);
 		irq_work_queue(this_cpu_ptr(&wake_up_klogd_work));
 	}
 	preempt_enable();
 }
 
-/**
- * wake_up_klogd - Wake kernel logging daemon
- *
- * Use this function when new records have been added to the ringbuffer
- * and the console printing of those records has already occurred or is
- * known to be handled by some other context. This function will only
- * wake the logging daemon.
- *
- * Context: Any context.
- */
-void wake_up_klogd(void)
-{
-	__wake_up_klogd(PRINTK_PENDING_WAKEUP);
-}
-
-/**
- * defer_console_output - Wake kernel logging daemon and trigger
- *	console printing in a deferred context
- *
- * Use this function when new records have been added to the ringbuffer,
- * this context is responsible for console printing those records, but
- * the current context is not allowed to perform the console printing.
- * Trigger an irq_work context to perform the console printing. This
- * function also wakes the logging daemon.
- *
- * Context: Any context.
- */
 void defer_console_output(void)
 {
-	/*
-	 * New messages may have been added directly to the ringbuffer
-	 * using vprintk_store(), so wake any waiters as well.
-	 */
-	__wake_up_klogd(PRINTK_PENDING_WAKEUP | PRINTK_PENDING_OUTPUT);
+	if (!printk_percpu_data_ready())
+		return;
+
+	preempt_disable();
+	__this_cpu_or(printk_pending, PRINTK_PENDING_OUTPUT);
+	irq_work_queue(this_cpu_ptr(&wake_up_klogd_work));
+	preempt_enable();
 }
 
 void printk_trigger_flush(void)
@@ -3350,7 +3287,12 @@ void printk_trigger_flush(void)
 
 int vprintk_deferred(const char *fmt, va_list args)
 {
-	return vprintk_emit(0, LOGLEVEL_SCHED, NULL, fmt, args);
+	int r;
+
+	r = vprintk_emit(0, LOGLEVEL_SCHED, NULL, fmt, args);
+	defer_console_output();
+
+	return r;
 }
 
 int _printk_deferred(const char *fmt, ...)

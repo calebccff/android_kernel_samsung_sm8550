@@ -353,13 +353,11 @@ static const struct hda_dsp_msg_code hda_dsp_rom_msg[] = {
 
 static void hda_dsp_get_status(struct snd_sof_dev *sdev)
 {
-	const struct sof_intel_dsp_desc *chip;
 	u32 status;
 	int i;
 
-	chip = get_chip_info(sdev->pdata);
 	status = snd_sof_dsp_read(sdev, HDA_DSP_BAR,
-				  chip->rom_status_reg);
+				  HDA_DSP_SRAM_REG_ROM_STATUS);
 
 	for (i = 0; i < ARRAY_SIZE(hda_dsp_rom_msg); i++) {
 		if (status == hda_dsp_rom_msg[i].code) {
@@ -404,16 +402,14 @@ static void hda_dsp_get_registers(struct snd_sof_dev *sdev,
 /* dump the first 8 dwords representing the extended ROM status */
 static void hda_dsp_dump_ext_rom_status(struct snd_sof_dev *sdev, u32 flags)
 {
-	const struct sof_intel_dsp_desc *chip;
 	char msg[128];
 	int len = 0;
 	u32 value;
 	int i;
 
-	chip = get_chip_info(sdev->pdata);
 	for (i = 0; i < HDA_EXT_ROM_STATUS_SIZE; i++) {
-		value = snd_sof_dsp_read(sdev, HDA_DSP_BAR, chip->rom_status_reg + i * 0x4);
-		len += scnprintf(msg + len, sizeof(msg) - len, " 0x%x", value);
+		value = snd_sof_dsp_read(sdev, HDA_DSP_BAR, HDA_DSP_SRAM_REG_ROM_STATUS + i * 0x4);
+		len += snprintf(msg + len, sizeof(msg) - len, " 0x%x", value);
 	}
 
 	sof_dev_dbg_or_err(sdev->dev, flags & SOF_DBG_DUMP_FORCE_ERR_LEVEL,
@@ -1040,22 +1036,12 @@ static int hda_generic_machine_select(struct snd_sof_dev *sdev)
 			pdata->machine = hda_mach;
 			pdata->tplg_filename = tplg_filename;
 
-			if (codec_num == 2 ||
-			    (codec_num == 1 && !HDA_IDISP_CODEC(bus->codec_mask))) {
+			if (codec_num == 2) {
 				/*
 				 * Prevent SoundWire links from starting when an external
 				 * HDaudio codec is used
 				 */
 				hda_mach->mach_params.link_mask = 0;
-			} else {
-				/*
-				 * Allow SoundWire links to start when no external HDaudio codec
-				 * was detected. This will not create a SoundWire card but
-				 * will help detect if any SoundWire codec reports as ATTACHED.
-				 */
-				struct sof_intel_hda_dev *hdev = sdev->pdata->hw_pdata;
-
-				hda_mach->mach_params.link_mask = hdev->info.link_mask;
 			}
 		}
 	}

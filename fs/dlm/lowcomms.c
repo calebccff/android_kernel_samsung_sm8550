@@ -1319,8 +1319,6 @@ struct dlm_msg *dlm_lowcomms_new_msg(int nodeid, int len, gfp_t allocation,
 		return NULL;
 	}
 
-	/* for dlm_lowcomms_commit_msg() */
-	kref_get(&msg->ref);
 	/* we assume if successful commit must called */
 	msg->idx = idx;
 	return msg;
@@ -1355,8 +1353,6 @@ void dlm_lowcomms_commit_msg(struct dlm_msg *msg)
 {
 	_dlm_lowcomms_commit_msg(msg);
 	srcu_read_unlock(&connections_srcu, msg->idx);
-	/* because dlm_lowcomms_new_msg() */
-	kref_put(&msg->ref, dlm_msg_release);
 }
 
 void dlm_lowcomms_put_msg(struct dlm_msg *msg)
@@ -1520,11 +1516,7 @@ static void process_recv_sockets(struct work_struct *work)
 
 static void process_listen_recv_socket(struct work_struct *work)
 {
-	int ret;
-
-	do {
-		ret = accept_from_sock(&listen_con);
-	} while (!ret);
+	accept_from_sock(&listen_con);
 }
 
 static void dlm_connect(struct connection *con)
@@ -1784,7 +1776,7 @@ static int dlm_listen_for_all(void)
 				  SOCK_STREAM, dlm_proto_ops->proto, &sock);
 	if (result < 0) {
 		log_print("Can't create comms socket, check SCTP is loaded");
-		return result;
+		goto out;
 	}
 
 	sock_set_mark(sock->sk, dlm_config.ci_mark);
@@ -1801,7 +1793,7 @@ static int dlm_listen_for_all(void)
 	result = sock->ops->listen(sock, 5);
 	if (result < 0) {
 		dlm_close_sock(&listen_con.sock);
-		return result;
+		goto out;
 	}
 
 	return 0;
@@ -1959,6 +1951,10 @@ static const struct dlm_proto_ops dlm_sctp_ops = {
 int dlm_lowcomms_start(void)
 {
 	int error = -EINVAL;
+	int i;
+
+	for (i = 0; i < CONN_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(&connection_hash[i]);
 
 	init_local();
 	if (!dlm_local_count) {
@@ -1966,6 +1962,8 @@ int dlm_lowcomms_start(void)
 		log_print("no local IP address has been set");
 		goto fail;
 	}
+
+	INIT_WORK(&listen_con.rwork, process_listen_recv_socket);
 
 	error = work_start();
 	if (error)
@@ -1998,21 +1996,12 @@ fail_listen:
 	dlm_proto_ops = NULL;
 fail_proto_ops:
 	dlm_allow_conn = 0;
+	dlm_close_sock(&listen_con.sock);
 	work_stop();
 fail_local:
 	deinit_local();
 fail:
 	return error;
-}
-
-void dlm_lowcomms_init(void)
-{
-	int i;
-
-	for (i = 0; i < CONN_HASH_SIZE; i++)
-		INIT_HLIST_HEAD(&connection_hash[i]);
-
-	INIT_WORK(&listen_con.rwork, process_listen_recv_socket);
 }
 
 void dlm_lowcomms_exit(void)

@@ -202,8 +202,8 @@ static void n_tty_kick_worker(struct tty_struct *tty)
 	struct n_tty_data *ldata = tty->disc_data;
 
 	/* Did the input worker stop? Restart it */
-	if (unlikely(READ_ONCE(ldata->no_room))) {
-		WRITE_ONCE(ldata->no_room, 0);
+	if (unlikely(ldata->no_room)) {
+		ldata->no_room = 0;
 
 		WARN_RATELIMIT(tty->port->itty == NULL,
 				"scheduling with invalid itty\n");
@@ -1661,7 +1661,7 @@ n_tty_receive_buf_common(struct tty_struct *tty, const unsigned char *cp,
 			if (overflow && room < 0)
 				ldata->read_head--;
 			room = overflow;
-			WRITE_ONCE(ldata->no_room, flow && !room);
+			ldata->no_room = flow && !room;
 		} else
 			overflow = 0;
 
@@ -1691,17 +1691,6 @@ n_tty_receive_buf_common(struct tty_struct *tty, const unsigned char *cp,
 		}
 	} else
 		n_tty_check_throttle(tty);
-
-	if (unlikely(ldata->no_room)) {
-		/*
-		 * Barrier here is to ensure to read the latest read_tail in
-		 * chars_in_buffer() and to make sure that read_tail is not loaded
-		 * before ldata->no_room is set.
-		 */
-		smp_mb();
-		if (!chars_in_buffer(tty))
-			n_tty_kick_worker(tty);
-	}
 
 	up_read(&tty->termios_rwsem);
 
@@ -2023,35 +2012,6 @@ static bool canon_copy_from_read_buf(struct tty_struct *tty,
 	return ldata->read_tail != canon_head;
 }
 
-/*
- * If we finished a read at the exact location of an
- * EOF (special EOL character that's a __DISABLED_CHAR)
- * in the stream, silently eat the EOF.
- */
-static void canon_skip_eof(struct tty_struct *tty)
-{
-	struct n_tty_data *ldata = tty->disc_data;
-	size_t tail, canon_head;
-
-	canon_head = smp_load_acquire(&ldata->canon_head);
-	tail = ldata->read_tail;
-
-	// No data?
-	if (tail == canon_head)
-		return;
-
-	// See if the tail position is EOF in the circular buffer
-	tail &= (N_TTY_BUF_SIZE - 1);
-	if (!test_bit(tail, ldata->read_flags))
-		return;
-	if (read_buf(ldata, tail) != __DISABLED_CHAR)
-		return;
-
-	// Clear the EOL bit, skip the EOF char.
-	clear_bit(tail, ldata->read_flags);
-	smp_store_release(&ldata->read_tail, ldata->read_tail + 1);
-}
-
 /**
  *	job_control		-	check job control
  *	@tty: tty
@@ -2111,7 +2071,7 @@ static ssize_t n_tty_read(struct tty_struct *tty, struct file *file,
 	ssize_t retval = 0;
 	long timeout;
 	bool packet;
-	size_t old_tail;
+	size_t tail;
 
 	/*
 	 * Is this a continuation of a read started earler?
@@ -2121,14 +2081,7 @@ static ssize_t n_tty_read(struct tty_struct *tty, struct file *file,
 	 */
 	if (*cookie) {
 		if (ldata->icanon && !L_EXTPROC(tty)) {
-			/*
-			 * If we have filled the user buffer, see
-			 * if we should skip an EOF character before
-			 * releasing the lock and returning done.
-			 */
-			if (!nr)
-				canon_skip_eof(tty);
-			else if (canon_copy_from_read_buf(tty, &kb, &nr))
+			if (canon_copy_from_read_buf(tty, &kb, &nr))
 				return kb - kbuf;
 		} else {
 			if (copy_from_read_buf(tty, &kb, &nr))
@@ -2174,7 +2127,7 @@ static ssize_t n_tty_read(struct tty_struct *tty, struct file *file,
 	}
 
 	packet = tty->ctrl.packet;
-	old_tail = ldata->read_tail;
+	tail = ldata->read_tail;
 
 	add_wait_queue(&tty->read_wait, &wait);
 	while (nr) {
@@ -2263,14 +2216,8 @@ more_to_be_read:
 		if (time)
 			timeout = time;
 	}
-	if (old_tail != ldata->read_tail) {
-		/*
-		 * Make sure no_room is not read in n_tty_kick_worker()
-		 * before setting ldata->read_tail in copy_from_read_buf().
-		 */
-		smp_mb();
+	if (tail != ldata->read_tail)
 		n_tty_kick_worker(tty);
-	}
 	up_read(&tty->termios_rwsem);
 
 	remove_wait_queue(&tty->read_wait, &wait);

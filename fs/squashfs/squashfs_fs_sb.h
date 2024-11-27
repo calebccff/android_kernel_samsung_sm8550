@@ -47,7 +47,6 @@ struct squashfs_sb_info {
 	struct squashfs_cache			*block_cache;
 	struct squashfs_cache			*fragment_cache;
 	struct squashfs_cache			*read_page;
-	struct address_space			*cache_mapping;
 	int					next_meta_index;
 	__le64					*id_table;
 	__le64					*fragment_index;
@@ -64,7 +63,7 @@ struct squashfs_sb_info {
 	long long				bytes_used;
 	unsigned int				inodes;
 	unsigned int				fragments;
-	unsigned int				xattr_ids;
+	int					xattr_ids;
 	unsigned int				ids;
 	bool					panic_on_errors;
 };

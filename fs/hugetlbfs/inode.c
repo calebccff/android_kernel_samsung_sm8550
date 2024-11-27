@@ -135,7 +135,6 @@ static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	loff_t len, vma_len;
 	int ret;
 	struct hstate *h = hstate_file(file);
-	vm_flags_t vm_flags;
 
 	/*
 	 * vma address alignment (but not the pgoff alignment) has
@@ -177,20 +176,10 @@ static int hugetlbfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 	file_accessed(file);
 
 	ret = -ENOMEM;
-
-	vm_flags = vma->vm_flags;
-	/*
-	 * for SHM_HUGETLB, the pages are reserved in the shmget() call so skip
-	 * reserving here. Note: only for SHM hugetlbfs file, the inode
-	 * flag S_PRIVATE is set.
-	 */
-	if (inode->i_flags & S_PRIVATE)
-		vm_flags |= VM_NORESERVE;
-
 	if (!hugetlb_reserve_pages(inode,
 				vma->vm_pgoff >> huge_page_order(h),
 				len >> huge_page_shift(h), vma,
-				vm_flags))
+				vma->vm_flags))
 		goto out;
 
 	ret = 0;
@@ -371,12 +360,6 @@ static ssize_t hugetlbfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			copied = iov_iter_zero(nr, to);
 		} else {
 			unlock_page(page);
-
-			if (PageHWPoison(page)) {
-				put_page(page);
-				retval = -EIO;
-				break;
-			}
 
 			/*
 			 * We have the page, copy it to user space buffer.
@@ -1001,6 +984,13 @@ static int hugetlbfs_migrate_page(struct address_space *mapping,
 static int hugetlbfs_error_remove_page(struct address_space *mapping,
 				struct page *page)
 {
+	struct inode *inode = mapping->host;
+	pgoff_t index = page->index;
+
+	remove_huge_page(page);
+	if (unlikely(hugetlb_unreserve_pages(inode, index, index + 1, 1)))
+		hugetlb_fix_reserve_counts(inode);
+
 	return 0;
 }
 
@@ -1058,12 +1048,12 @@ static int hugetlbfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 		if (sbinfo->spool) {
 			long free_pages;
 
-			spin_lock_irq(&sbinfo->spool->lock);
+			spin_lock(&sbinfo->spool->lock);
 			buf->f_blocks = sbinfo->spool->max_hpages;
 			free_pages = sbinfo->spool->max_hpages
 				- sbinfo->spool->used_hpages;
 			buf->f_bavail = buf->f_bfree = free_pages;
-			spin_unlock_irq(&sbinfo->spool->lock);
+			spin_unlock(&sbinfo->spool->lock);
 			buf->f_files = sbinfo->max_inodes;
 			buf->f_ffree = sbinfo->free_inodes;
 		}
@@ -1234,7 +1224,6 @@ static int hugetlbfs_parse_param(struct fs_context *fc, struct fs_parameter *par
 {
 	struct hugetlbfs_fs_context *ctx = fc->fs_private;
 	struct fs_parse_result result;
-	struct hstate *h;
 	char *rest;
 	unsigned long ps;
 	int opt;
@@ -1262,7 +1251,7 @@ static int hugetlbfs_parse_param(struct fs_context *fc, struct fs_parameter *par
 
 	case Opt_size:
 		/* memparse() will accept a K/M/G without a digit */
-		if (!param->string || !isdigit(param->string[0]))
+		if (!isdigit(param->string[0]))
 			goto bad_val;
 		ctx->max_size_opt = memparse(param->string, &rest);
 		ctx->max_val_type = SIZE_STD;
@@ -1272,24 +1261,23 @@ static int hugetlbfs_parse_param(struct fs_context *fc, struct fs_parameter *par
 
 	case Opt_nr_inodes:
 		/* memparse() will accept a K/M/G without a digit */
-		if (!param->string || !isdigit(param->string[0]))
+		if (!isdigit(param->string[0]))
 			goto bad_val;
 		ctx->nr_inodes = memparse(param->string, &rest);
 		return 0;
 
 	case Opt_pagesize:
 		ps = memparse(param->string, &rest);
-		h = size_to_hstate(ps);
-		if (!h) {
+		ctx->hstate = size_to_hstate(ps);
+		if (!ctx->hstate) {
 			pr_err("Unsupported page size %lu MB\n", ps >> 20);
 			return -EINVAL;
 		}
-		ctx->hstate = h;
 		return 0;
 
 	case Opt_min_size:
 		/* memparse() will accept a K/M/G without a digit */
-		if (!param->string || !isdigit(param->string[0]))
+		if (!isdigit(param->string[0]))
 			goto bad_val;
 		ctx->min_size_opt = memparse(param->string, &rest);
 		ctx->min_val_type = SIZE_STD;

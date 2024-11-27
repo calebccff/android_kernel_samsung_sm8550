@@ -56,7 +56,6 @@
 #include <linux/file.h>
 #include <linux/fs_parser.h>
 #include <linux/sched/cputime.h>
-#include <linux/sched/deadline.h>
 #include <linux/psi.h>
 #include <net/sock.h>
 
@@ -1745,7 +1744,7 @@ int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
 {
 	struct cgroup *dcgrp = &dst_root->cgrp;
 	struct cgroup_subsys *ss;
-	int ssid, ret;
+	int ssid, i, ret;
 	u16 dfl_disable_ss_mask = 0;
 
 	lockdep_assert_held(&cgroup_mutex);
@@ -1789,8 +1788,7 @@ int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
 		struct cgroup_root *src_root = ss->root;
 		struct cgroup *scgrp = &src_root->cgrp;
 		struct cgroup_subsys_state *css = cgroup_css(scgrp, ss);
-		struct css_set *cset, *cset_pos;
-		struct css_task_iter *it;
+		struct css_set *cset;
 
 		WARN_ON(!css || cgroup_css(dcgrp, ss));
 
@@ -1808,22 +1806,9 @@ int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
 		css->cgroup = dcgrp;
 
 		spin_lock_irq(&css_set_lock);
-		WARN_ON(!list_empty(&dcgrp->e_csets[ss->id]));
-		list_for_each_entry_safe(cset, cset_pos, &scgrp->e_csets[ss->id],
-					 e_cset_node[ss->id]) {
+		hash_for_each(css_set_table, i, cset, hlist)
 			list_move_tail(&cset->e_cset_node[ss->id],
 				       &dcgrp->e_csets[ss->id]);
-			/*
-			 * all css_sets of scgrp together in same order to dcgrp,
-			 * patch in-flight iterators to preserve correct iteration.
-			 * since the iterator is always advanced right away and
-			 * finished when it->cset_pos meets it->cset_head, so only
-			 * update it->cset_head is enough here.
-			 */
-			list_for_each_entry(it, &cset->task_iters, iters_node)
-				if (it->cset_head == &scgrp->e_csets[ss->id])
-					it->cset_head = &dcgrp->e_csets[ss->id];
-		}
 		spin_unlock_irq(&css_set_lock);
 
 		if (ss->css_rstat_flush) {
@@ -2373,12 +2358,12 @@ EXPORT_SYMBOL_GPL(task_cgroup_path);
  * Unfortunately, letting ->attach() operations acquire cpus_read_lock() can
  * lead to deadlocks.
  *
- * Bringing up a CPU may involve creating and destroying tasks which requires
- * read-locking threadgroup_rwsem, so threadgroup_rwsem nests inside
- * cpus_read_lock(). If we call an ->attach() which acquires the cpus lock while
- * write-locking threadgroup_rwsem, the locking order is reversed and we end up
- * waiting for an on-going CPU hotplug operation which in turn is waiting for
- * the threadgroup_rwsem to be released to create new tasks. For more details:
+ * Bringing up a CPU may involve creating new tasks which requires read-locking
+ * threadgroup_rwsem, so threadgroup_rwsem nests inside cpus_read_lock(). If we
+ * call an ->attach() which acquires the cpus lock while write-locking
+ * threadgroup_rwsem, the locking order is reversed and we end up waiting for an
+ * on-going CPU hotplug operation which in turn is waiting for the
+ * threadgroup_rwsem to be released to create new tasks. For more details:
  *
  *   http://lkml.kernel.org/r/20220711174629.uehfmqegcwn2lqzu@wubuntu
  *
@@ -4324,7 +4309,6 @@ int cgroup_add_dfl_cftypes(struct cgroup_subsys *ss, struct cftype *cfts)
 		cft->flags |= __CFTYPE_ONLY_ON_DFL;
 	return cgroup_add_cftypes(ss, cfts);
 }
-EXPORT_SYMBOL_GPL(cgroup_add_dfl_cftypes);
 
 /**
  * cgroup_add_legacy_cftypes - add an array of cftypes for legacy hierarchies
@@ -6050,23 +6034,17 @@ struct cgroup *cgroup_get_from_id(u64 id)
 	struct kernfs_node *kn;
 	struct cgroup *cgrp = NULL;
 
+	mutex_lock(&cgroup_mutex);
 	kn = kernfs_find_and_get_node_by_id(cgrp_dfl_root.kf_root, id);
 	if (!kn)
-		goto out;
+		goto out_unlock;
 
-	if (kernfs_type(kn) != KERNFS_DIR)
-		goto put;
-
-	rcu_read_lock();
-
-	cgrp = rcu_dereference(*(void __rcu __force **)&kn->priv);
-	if (cgrp && !cgroup_tryget(cgrp))
+	cgrp = kn->priv;
+	if (cgroup_is_dead(cgrp) || !cgroup_tryget(cgrp))
 		cgrp = NULL;
-
-	rcu_read_unlock();
-put:
 	kernfs_put(kn);
-out:
+out_unlock:
+	mutex_unlock(&cgroup_mutex);
 	return cgrp;
 }
 EXPORT_SYMBOL_GPL(cgroup_get_from_id);
@@ -6288,18 +6266,19 @@ err:
 static void cgroup_css_set_put_fork(struct kernel_clone_args *kargs)
 	__releases(&cgroup_threadgroup_rwsem) __releases(&cgroup_mutex)
 {
-	struct cgroup *cgrp = kargs->cgrp;
-	struct css_set *cset = kargs->cset;
-
 	cgroup_threadgroup_change_end(current);
 
-	if (cset) {
-		put_css_set(cset);
-		kargs->cset = NULL;
-	}
-
 	if (kargs->flags & CLONE_INTO_CGROUP) {
+		struct cgroup *cgrp = kargs->cgrp;
+		struct css_set *cset = kargs->cset;
+
 		mutex_unlock(&cgroup_mutex);
+
+		if (cset) {
+			put_css_set(cset);
+			kargs->cset = NULL;
+		}
+
 		if (cgrp) {
 			cgroup_put(cgrp);
 			kargs->cgrp = NULL;
@@ -6482,9 +6461,6 @@ void cgroup_exit(struct task_struct *tsk)
 	list_add_tail(&tsk->cg_list, &cset->dying_tasks);
 	cset->nr_tasks--;
 
-	if (dl_task(tsk))
-		dec_dl_tasks_cs(tsk);
-
 	WARN_ON_ONCE(cgroup_task_frozen(tsk));
 	if (unlikely(!(tsk->flags & PF_KTHREAD) &&
 		     test_bit(CGRP_FREEZE, &task_dfl_cgroup(tsk)->flags)))
@@ -6622,38 +6598,30 @@ struct cgroup_subsys_state *css_from_id(int id, struct cgroup_subsys *ss)
  *
  * Find the cgroup at @path on the default hierarchy, increment its
  * reference count and return it.  Returns pointer to the found cgroup on
- * success, ERR_PTR(-ENOENT) if @path doesn't exist or if the cgroup has already
- * been released and ERR_PTR(-ENOTDIR) if @path points to a non-directory.
+ * success, ERR_PTR(-ENOENT) if @path doesn't exist and ERR_PTR(-ENOTDIR)
+ * if @path points to a non-directory.
  */
 struct cgroup *cgroup_get_from_path(const char *path)
 {
 	struct kernfs_node *kn;
-	struct cgroup *cgrp = ERR_PTR(-ENOENT);
-	struct cgroup *root_cgrp;
+	struct cgroup *cgrp;
 
-	spin_lock_irq(&css_set_lock);
-	root_cgrp = current_cgns_cgroup_from_root(&cgrp_dfl_root);
-	kn = kernfs_walk_and_get(root_cgrp->kn, path);
-	spin_unlock_irq(&css_set_lock);
-	if (!kn)
-		goto out;
+	mutex_lock(&cgroup_mutex);
 
-	if (kernfs_type(kn) != KERNFS_DIR) {
-		cgrp = ERR_PTR(-ENOTDIR);
-		goto out_kernfs;
+	kn = kernfs_walk_and_get(cgrp_dfl_root.cgrp.kn, path);
+	if (kn) {
+		if (kernfs_type(kn) == KERNFS_DIR) {
+			cgrp = kn->priv;
+			cgroup_get_live(cgrp);
+		} else {
+			cgrp = ERR_PTR(-ENOTDIR);
+		}
+		kernfs_put(kn);
+	} else {
+		cgrp = ERR_PTR(-ENOENT);
 	}
 
-	rcu_read_lock();
-
-	cgrp = rcu_dereference(*(void __rcu __force **)&kn->priv);
-	if (!cgrp || !cgroup_tryget(cgrp))
-		cgrp = ERR_PTR(-ENOENT);
-
-	rcu_read_unlock();
-
-out_kernfs:
-	kernfs_put(kn);
-out:
+	mutex_unlock(&cgroup_mutex);
 	return cgrp;
 }
 EXPORT_SYMBOL_GPL(cgroup_get_from_path);

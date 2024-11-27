@@ -214,7 +214,14 @@ static void cred_init_security(void)
 	struct cred *cred = (struct cred *) current->real_cred;
 	struct task_security_struct *tsec;
 
+#ifdef CONFIG_KDP_CRED
+	tsec = &init_sec;
+	tsec->bp_cred = cred;
+	// is not support 5.4 upper version, so we added
+	cred->security = tsec;
+#else
 	tsec = selinux_cred(cred);
+#endif
 	tsec->osid = tsec->sid = SECINITSID_KERNEL;
 }
 
@@ -739,6 +746,9 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 
 	if (!strcmp(sb->s_type->name, "debugfs") ||
 	    !strcmp(sb->s_type->name, "tracefs") ||
+	// [ SEC_SELINUX_PORTING_COMMON
+		!strcmp(sb->s_type->name, "configfs") ||
+	// ] SEC_SELINUX_PORTING_COMMON
 	    !strcmp(sb->s_type->name, "binder") ||
 	    !strcmp(sb->s_type->name, "bpf") ||
 	    !strcmp(sb->s_type->name, "pstore"))
@@ -2945,8 +2955,7 @@ static void selinux_inode_free_security(struct inode *inode)
 }
 
 static int selinux_dentry_init_security(struct dentry *dentry, int mode,
-					const struct qstr *name,
-					const char **xattr_name, void **ctx,
+					const struct qstr *name, void **ctx,
 					u32 *ctxlen)
 {
 	u32 newsid;
@@ -2958,9 +2967,6 @@ static int selinux_dentry_init_security(struct dentry *dentry, int mode,
 					   &newsid);
 	if (rc)
 		return rc;
-
-	if (xattr_name)
-		*xattr_name = XATTR_NAME_SELINUX;
 
 	return security_sid_to_context(&selinux_state, newsid, (char **)ctx,
 				       ctxlen);
@@ -3812,33 +3818,6 @@ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
 		error = ioctl_has_perm(cred, file, FILE__IOCTL, (u16) cmd);
 	}
 	return error;
-}
-
-static int selinux_file_ioctl_compat(struct file *file, unsigned int cmd,
-			      unsigned long arg)
-{
-	/*
-	 * If we are in a 64-bit kernel running 32-bit userspace, we need to
-	 * make sure we don't compare 32-bit flags to 64-bit flags.
-	 */
-	switch (cmd) {
-	case FS_IOC32_GETFLAGS:
-		cmd = FS_IOC_GETFLAGS;
-		break;
-	case FS_IOC32_SETFLAGS:
-		cmd = FS_IOC_SETFLAGS;
-		break;
-	case FS_IOC32_GETVERSION:
-		cmd = FS_IOC_GETVERSION;
-		break;
-	case FS_IOC32_SETVERSION:
-		cmd = FS_IOC_SETVERSION;
-		break;
-	default:
-		break;
-	}
-
-	return selinux_file_ioctl(file, cmd, arg);
 }
 
 static int default_noexec __ro_after_init;
@@ -4805,13 +4784,6 @@ static int selinux_socket_bind(struct socket *sock, struct sockaddr *address, in
 				return -EINVAL;
 			addr4 = (struct sockaddr_in *)address;
 			if (family_sa == AF_UNSPEC) {
-				if (family == PF_INET6) {
-					/* Length check from inet6_bind_sk() */
-					if (addrlen < SIN6_LEN_RFC2133)
-						return -EINVAL;
-					/* Family check from __inet6_bind() */
-					goto err_af;
-				}
 				/* see __inet_bind(), we only want to allow
 				 * AF_UNSPEC if the address is INADDR_ANY
 				 */
@@ -7167,7 +7139,11 @@ static int selinux_perf_event_write(struct perf_event *event)
  * safely. Breaking the ordering rules above might lead to NULL pointer derefs
  * when disabling SELinux at runtime.
  */
+#ifdef CONFIG_KDP_CRED
+static struct security_hook_list selinux_hooks[] __lsm_ro_after_init_kdp = {
+#else
 static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
+#endif
 	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
 	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
 	LSM_HOOK_INIT(binder_transfer_binder, selinux_binder_transfer_binder),
@@ -7239,7 +7215,6 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(file_permission, selinux_file_permission),
 	LSM_HOOK_INIT(file_alloc_security, selinux_file_alloc_security),
 	LSM_HOOK_INIT(file_ioctl, selinux_file_ioctl),
-	LSM_HOOK_INIT(file_ioctl_compat, selinux_file_ioctl_compat),
 	LSM_HOOK_INIT(mmap_file, selinux_mmap_file),
 	LSM_HOOK_INIT(mmap_addr, selinux_mmap_addr),
 	LSM_HOOK_INIT(file_mprotect, selinux_file_mprotect),

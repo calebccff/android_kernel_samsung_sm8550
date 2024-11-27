@@ -272,7 +272,7 @@ alternative_if ARM64_HAS_ADDRESS_AUTH
 alternative_else_nop_endif
 1:
 
-	scs_load_current
+	scs_load tsk
 	.else
 	add	x21, sp, #PT_REGS_SIZE
 	get_current_task tsk
@@ -691,7 +691,9 @@ alternative_else_nop_endif
 	tramp_map_kernel	x30
 alternative_insn isb, nop, ARM64_WORKAROUND_QCOM_FALKOR_E1003
 	tramp_data_read_var	x30, vectors
+alternative_if_not ARM64_WORKAROUND_CAVIUM_TX2_219_PRFM
 	prfm	plil1strm, [x30, #(1b - \vector_start)]
+alternative_else_nop_endif
 
 	msr	vbar_el1, x30
 	isb
@@ -853,7 +855,7 @@ SYM_FUNC_START(cpu_switch_to)
 	msr	sp_el0, x1
 	ptrauth_keys_install_kernel x1, x8, x9, x10
 	scs_save x0
-	scs_load_current
+	scs_load x1
 	ret
 SYM_FUNC_END(cpu_switch_to)
 NOKPROBE(cpu_switch_to)
@@ -881,19 +883,19 @@ NOKPROBE(ret_from_fork)
  */
 SYM_FUNC_START(call_on_irq_stack)
 #ifdef CONFIG_SHADOW_CALL_STACK
-	get_current_task x16
-	scs_save x16
+	stp	scs_sp, xzr, [sp, #-16]!
 	ldr_this_cpu scs_sp, irq_shadow_call_stack_ptr, x17
 #endif
-
 	/* Create a frame record to save our LR and SP (implicit in FP) */
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 
 	ldr_this_cpu x16, irq_stack_ptr, x17
+	mov	x15, #IRQ_STACK_SIZE
+	add	x16, x16, x15
 
 	/* Move to the new stack and call the function there */
-	add	sp, x16, #IRQ_STACK_SIZE
+	mov	sp, x16
 	blr	x1
 
 	/*
@@ -902,7 +904,9 @@ SYM_FUNC_START(call_on_irq_stack)
 	 */
 	mov	sp, x29
 	ldp	x29, x30, [sp], #16
-	scs_load_current
+#ifdef CONFIG_SHADOW_CALL_STACK
+	ldp	scs_sp, xzr, [sp], #16
+#endif
 	ret
 SYM_FUNC_END(call_on_irq_stack)
 NOKPROBE(call_on_irq_stack)
@@ -1003,13 +1007,9 @@ SYM_CODE_START(__sdei_asm_handler)
 
 	mov	x19, x1
 
-	/* Store the registered-event for crash_smp_send_stop() */
+#if defined(CONFIG_VMAP_STACK) || defined(CONFIG_SHADOW_CALL_STACK)
 	ldrb	w4, [x19, #SDEI_EVENT_PRIORITY]
-	cbnz	w4, 1f
-	adr_this_cpu dst=x5, sym=sdei_active_normal_event, tmp=x6
-	b	2f
-1:	adr_this_cpu dst=x5, sym=sdei_active_critical_event, tmp=x6
-2:	str	x19, [x5]
+#endif
 
 #ifdef CONFIG_VMAP_STACK
 	/*
@@ -1074,14 +1074,6 @@ SYM_CODE_START(__sdei_asm_handler)
 
 	ldr_l	x2, sdei_exit_mode
 
-	/* Clear the registered-event seen by crash_smp_send_stop() */
-	ldrb	w3, [x4, #SDEI_EVENT_PRIORITY]
-	cbnz	w3, 1f
-	adr_this_cpu dst=x5, sym=sdei_active_normal_event, tmp=x6
-	b	2f
-1:	adr_this_cpu dst=x5, sym=sdei_active_critical_event, tmp=x6
-2:	str	xzr, [x5]
-
 alternative_if_not ARM64_UNMAP_KERNEL_AT_EL0
 	sdei_handler_exit exit_mode=x2
 alternative_else_nop_endif
@@ -1092,15 +1084,4 @@ alternative_else_nop_endif
 #endif
 SYM_CODE_END(__sdei_asm_handler)
 NOKPROBE(__sdei_asm_handler)
-
-SYM_CODE_START(__sdei_handler_abort)
-	mov_q	x0, SDEI_1_0_FN_SDEI_EVENT_COMPLETE_AND_RESUME
-	adr	x1, 1f
-	ldr_l	x2, sdei_exit_mode
-	sdei_handler_exit exit_mode=x2
-	// exit the handler and jump to the next instruction.
-	// Exit will stomp x0-x17, PSTATE, ELR_ELx, and SPSR_ELx.
-1:	ret
-SYM_CODE_END(__sdei_handler_abort)
-NOKPROBE(__sdei_handler_abort)
 #endif /* CONFIG_ARM_SDE_INTERFACE */

@@ -761,16 +761,14 @@ static void enable_ptr_key_workfn(struct work_struct *work)
 
 static DECLARE_WORK(enable_ptr_key_work, enable_ptr_key_workfn);
 
-static int fill_random_ptr_key(struct notifier_block *nb,
-			       unsigned long action, void *data)
+static void fill_random_ptr_key(struct random_ready_callback *unused)
 {
 	/* This may be in an interrupt handler. */
 	queue_work(system_unbound_wq, &enable_ptr_key_work);
-	return 0;
 }
 
-static struct notifier_block random_ready = {
-	.notifier_call = fill_random_ptr_key
+static struct random_ready_callback random_ready = {
+	.func = fill_random_ptr_key
 };
 
 static int __init initialize_ptr_random(void)
@@ -784,7 +782,7 @@ static int __init initialize_ptr_random(void)
 		return 0;
 	}
 
-	ret = register_random_ready_notifier(&random_ready);
+	ret = add_random_ready_callback(&random_ready);
 	if (!ret) {
 		return 0;
 	} else if (ret == -EALREADY) {
@@ -2111,20 +2109,15 @@ char *fwnode_full_name_string(struct fwnode_handle *fwnode, char *buf,
 
 	/* Loop starting from the root node to the current node. */
 	for (depth = fwnode_count_parents(fwnode); depth >= 0; depth--) {
-		/*
-		 * Only get a reference for other nodes (i.e. parent nodes).
-		 * fwnode refcount may be 0 here.
-		 */
-		struct fwnode_handle *__fwnode = depth ?
-			fwnode_get_nth_parent(fwnode, depth) : fwnode;
+		struct fwnode_handle *__fwnode =
+			fwnode_get_nth_parent(fwnode, depth);
 
 		buf = string(buf, end, fwnode_get_name_prefix(__fwnode),
 			     default_str_spec);
 		buf = string(buf, end, fwnode_get_name(__fwnode),
 			     default_str_spec);
 
-		if (depth)
-			fwnode_handle_put(__fwnode);
+		fwnode_handle_put(__fwnode);
 	}
 
 	return buf;

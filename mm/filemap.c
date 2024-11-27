@@ -44,7 +44,16 @@
 #include <linux/page_idle.h>
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
+#include <trace/events/tracing_mark_write.h>
 #include "internal.h"
+
+#ifdef CONFIG_DDAR
+#include <ddar/cache_cleanup.h>
+#endif
+
+#ifdef CONFIG_PAGE_BOOST_RECORDING
+#include <linux/io_record.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/filemap.h>
@@ -121,10 +130,6 @@
  *   ->tasklist_lock            (memory_failure, collect_procs_ao)
  */
 
-/* Export tracepoints that act as a bare tracehook */
-EXPORT_TRACEPOINT_SYMBOL_GPL(mm_filemap_delete_from_page_cache);
-EXPORT_TRACEPOINT_SYMBOL_GPL(mm_filemap_add_to_page_cache);
-
 static void page_cache_delete(struct address_space *mapping,
 				   struct page *page, void *shadow)
 {
@@ -200,6 +205,8 @@ static void unaccount_page_cache_page(struct address_space *mapping,
 	__mod_lruvec_page_state(page, NR_FILE_PAGES, -nr);
 	if (PageSwapBacked(page)) {
 		__mod_lruvec_page_state(page, NR_SHMEM, -nr);
+		if (is_gpu_page(page))
+			total_kgsl_shmem_pages_sub(nr);
 		if (PageTransHuge(page))
 			__mod_lruvec_page_state(page, NR_SHMEM_THPS, -nr);
 	} else if (PageTransHuge(page)) {
@@ -229,6 +236,11 @@ static void unaccount_page_cache_page(struct address_space *mapping,
 void __delete_from_page_cache(struct page *page, void *shadow)
 {
 	struct address_space *mapping = page->mapping;
+
+#ifdef CONFIG_DDAR
+	if (mapping_sensitive(mapping))
+		sdp_page_cleanup(page);
+#endif
 
 	trace_mm_filemap_delete_from_page_cache(page);
 
@@ -1711,8 +1723,7 @@ __sched int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
 		if (flags & FAULT_FLAG_RETRY_NOWAIT)
 			return 0;
 
-		if (!(flags & FAULT_FLAG_SPECULATIVE))
-			mmap_read_unlock(mm);
+		mmap_read_unlock(mm);
 		if (flags & FAULT_FLAG_KILLABLE)
 			wait_on_page_locked_killable(page);
 		else
@@ -1724,8 +1735,7 @@ __sched int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
 
 		ret = __lock_page_killable(page);
 		if (ret) {
-			if (!(flags & FAULT_FLAG_SPECULATIVE))
-				mmap_read_unlock(mm);
+			mmap_read_unlock(mm);
 			return 0;
 		}
 	} else {
@@ -2096,11 +2106,7 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t start,
 
 	rcu_read_lock();
 	while ((page = find_get_entry(&xas, end, XA_PRESENT))) {
-		unsigned long next_idx = xas.xa_index + 1;
-
 		if (!xa_is_value(page)) {
-			if (PageTransHuge(page))
-				next_idx = page->index + thp_nr_pages(page);
 			if (page->index < start)
 				goto put;
 			if (page->index + thp_nr_pages(page) - 1 > end)
@@ -2121,11 +2127,13 @@ unlock:
 put:
 		put_page(page);
 next:
-		if (next_idx != xas.xa_index + 1) {
+		if (!xa_is_value(page) && PageTransHuge(page)) {
+			unsigned int nr_pages = thp_nr_pages(page);
+
 			/* Final THP may cross MAX_LFS_FILESIZE on 32-bit */
-			if (next_idx < xas.xa_index)
+			xas_set(&xas, page->index + nr_pages);
+			if (xas.xa_index < nr_pages)
 				break;
-			xas_set(&xas, next_idx);
 		}
 	}
 	rcu_read_unlock();
@@ -2544,19 +2552,18 @@ static int filemap_get_pages(struct kiocb *iocb, struct iov_iter *iter,
 	struct page *page;
 	int err = 0;
 
-	/* "last_index" is the index of the page beyond the end of the read */
 	last_index = DIV_ROUND_UP(iocb->ki_pos + iter->count, PAGE_SIZE);
 retry:
 	if (fatal_signal_pending(current))
 		return -EINTR;
 
-	filemap_get_read_batch(mapping, index, last_index - 1, pvec);
+	filemap_get_read_batch(mapping, index, last_index, pvec);
 	if (!pagevec_count(pvec)) {
 		if (iocb->ki_flags & IOCB_NOIO)
 			return -EAGAIN;
 		page_cache_sync_readahead(mapping, ra, filp, index,
 				last_index - index);
-		filemap_get_read_batch(mapping, index, last_index - 1, pvec);
+		filemap_get_read_batch(mapping, index, last_index, pvec);
 	}
 	if (!pagevec_count(pvec)) {
 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
@@ -2617,7 +2624,11 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 	int i, error = 0;
 	bool writably_mapped;
 	loff_t isize, end_offset;
-	loff_t last_pos = ra->prev_pos;
+#ifdef CONFIG_PAGE_BOOST_RECORDING
+	pgoff_t index;
+	loff_t *ppos = &iocb->ki_pos;
+	pgoff_t last_index;
+#endif
 
 	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
 		return 0;
@@ -2626,6 +2637,12 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 
 	iov_iter_truncate(iter, inode->i_sb->s_maxbytes);
 	pagevec_init(&pvec);
+
+#ifdef CONFIG_PAGE_BOOST_RECORDING
+	index = *ppos >> PAGE_SHIFT;
+	last_index = (*ppos + iov_iter_count(iter) + PAGE_SIZE-1) >> PAGE_SHIFT;
+	record_io_info(filp, index, last_index - index);
+#endif
 
 	do {
 		cond_resched();
@@ -2656,15 +2673,6 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		end_offset = min_t(loff_t, isize, iocb->ki_pos + iter->count);
 
 		/*
-		 * Pairs with a barrier in
-		 * block_write_end()->mark_buffer_dirty() or other page
-		 * dirtying routines like iomap_write_end() to ensure
-		 * changes to page contents are visible before we see
-		 * increased inode size.
-		 */
-		smp_rmb();
-
-		/*
 		 * Once we start copying data, we don't want to be touching any
 		 * cachelines that might be contended:
 		 */
@@ -2675,7 +2683,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		 * mark it as accessed the first time.
 		 */
 		if (iocb->ki_pos >> PAGE_SHIFT !=
-		    last_pos >> PAGE_SHIFT)
+		    ra->prev_pos >> PAGE_SHIFT)
 			mark_page_accessed(pvec.pages[0]);
 
 		for (i = 0; i < pagevec_count(&pvec); i++) {
@@ -2706,7 +2714,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 
 			already_read += copied;
 			iocb->ki_pos += copied;
-			last_pos = iocb->ki_pos;
+			ra->prev_pos = iocb->ki_pos;
 
 			if (copied < bytes) {
 				error = -EFAULT;
@@ -2720,7 +2728,7 @@ put_pages:
 	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
 
 	file_accessed(filp);
-	ra->prev_pos = last_pos;
+
 	return already_read ? already_read : error;
 }
 EXPORT_SYMBOL_GPL(filemap_read);
@@ -2951,6 +2959,39 @@ static int lock_page_maybe_drop_mmap(struct vm_fault *vmf, struct page *page,
 	return 1;
 }
 
+#ifdef CONFIG_TRACING
+static void filemap_tracing_mark_begin(struct file *file,
+		pgoff_t offset, unsigned int size, bool sync)
+{
+	char buf[TRACING_MARK_BUF_SIZE], *path;
+
+	if (!trace_tracing_mark_write_enabled())
+		return;
+
+	path = file_path(file, buf, TRACING_MARK_BUF_SIZE);
+	if (IS_ERR(path)) {
+		sprintf(buf, "file_path failed(%ld)", PTR_ERR(path));
+		path = buf;
+	}
+
+	tracing_mark_begin("%d , %s , %lu , %d", sync, path, offset, size);
+}
+
+static void filemap_tracing_mark_end(void)
+{
+	tracing_mark_end();
+}
+#else
+static inline void filemap_tracing_mark_begin(struct file *file,
+		pgoff_t offset, unsigned int size, bool sync) { }
+static inline void filemap_tracing_mark_end(void) { }
+#endif
+
+#if CONFIG_MMAP_READAROUND_LIMIT == 0
+unsigned int mmap_readaround_limit = VM_READAHEAD_PAGES; 		/* page */
+#else
+unsigned int mmap_readaround_limit = CONFIG_MMAP_READAROUND_LIMIT;	/* page */
+#endif
 
 /*
  * Synchronous readahead happens when we don't even find a page in the page
@@ -2967,6 +3008,8 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	DEFINE_READAHEAD(ractl, file, ra, mapping, vmf->pgoff);
 	struct file *fpin = NULL;
 	unsigned int mmap_miss;
+	unsigned int ra_pages;
+	pgoff_t offset = vmf->pgoff;
 
 	/* If we don't want any read-ahead, don't bother */
 	if (vmf->vma->vm_flags & VM_RAND_READ)
@@ -2976,7 +3019,9 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 
 	if (vmf->vma->vm_flags & VM_SEQ_READ) {
 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+		filemap_tracing_mark_begin(file, offset, ra->ra_pages, 1);
 		page_cache_sync_ra(&ractl, ra->ra_pages);
+		filemap_tracing_mark_end();
 		return fpin;
 	}
 
@@ -2996,13 +3041,16 @@ static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
 	 * mmap read-around
 	 */
 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
-	ra->start = max_t(long, 0, vmf->pgoff - ra->ra_pages / 2);
-	ra->size = ra->ra_pages;
-	ra->async_size = ra->ra_pages / 4;
-	trace_android_vh_tune_mmap_readaround(ra->ra_pages, vmf->pgoff,
-			&ra->start, &ra->size, &ra->async_size);
+	ra_pages = min_t(unsigned int, ra->ra_pages, mmap_readaround_limit);
+	if (need_memory_boosting())
+		ra_pages = min_t(unsigned int, ra_pages, 8);
+	ra->start = max_t(long, 0, vmf->pgoff - ra_pages / 2);
+	ra->size = ra_pages;
+	ra->async_size = ra_pages / 4;
 	ractl._index = ra->start;
+	filemap_tracing_mark_begin(file, offset, ra_pages, 1);
 	do_page_cache_ra(&ractl, ra->size, ra->async_size);
+	filemap_tracing_mark_end();
 	return fpin;
 }
 
@@ -3029,8 +3077,10 @@ static struct file *do_async_mmap_readahead(struct vm_fault *vmf,
 		WRITE_ONCE(ra->mmap_miss, --mmap_miss);
 	if (PageReadahead(page)) {
 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+		filemap_tracing_mark_begin(file, offset, ra->ra_pages, 0);
 		page_cache_async_readahead(mapping, ra, file,
 					   page, offset, ra->ra_pages);
+		filemap_tracing_mark_end();
 	}
 	return fpin;
 }
@@ -3229,7 +3279,9 @@ page_not_uptodate:
 	 * and we need to check for errors.
 	 */
 	fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+	filemap_tracing_mark_begin(file, offset, 1, 1);
 	error = filemap_read_page(file, mapping, page);
+	filemap_tracing_mark_end();
 	if (fpin)
 		goto out_retry;
 	put_page(page);
@@ -3276,7 +3328,7 @@ static bool filemap_map_pmd(struct vm_fault *vmf, struct page *page)
 	    }
 	}
 
-	if (pmd_none(*vmf->pmd) && vmf->prealloc_pte) {
+	if (pmd_none(*vmf->pmd)) {
 		vmf->ptl = pmd_lock(mm, vmf->pmd);
 		if (likely(pmd_none(*vmf->pmd))) {
 			mm_inc_nr_ptes(mm);
@@ -3417,6 +3469,11 @@ unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 	vmf->pte = NULL;
 	WRITE_ONCE(file->f_ra.mmap_miss, mmap_miss);
+
+#ifdef CONFIG_PAGE_BOOST_RECORDING
+	/* end_pgoff is inclusive */
+	record_io_info(file, start_pgoff, last_pgoff - start_pgoff + 1);
+#endif
 	return ret;
 }
 EXPORT_SYMBOL(filemap_map_pages);
@@ -3823,7 +3880,7 @@ ssize_t generic_perform_write(struct file *file,
 		unsigned long offset;	/* Offset into pagecache page */
 		unsigned long bytes;	/* Bytes to write to page */
 		size_t copied;		/* Bytes copied from user */
-		void *fsdata = NULL;
+		void *fsdata;
 
 		offset = (pos & (PAGE_SIZE - 1));
 		bytes = min_t(unsigned long, PAGE_SIZE - offset,

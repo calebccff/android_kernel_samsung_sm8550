@@ -430,10 +430,7 @@ static struct net_device *icmp6_dev(const struct sk_buff *skb)
 	if (unlikely(dev->ifindex == LOOPBACK_IFINDEX || netif_is_l3_master(skb->dev))) {
 		const struct rt6_info *rt6 = skb_rt6_info(skb);
 
-		/* The destination could be an external IP in Ext Hdr (SRv6, RPL, etc.),
-		 * and ip6_null_entry could be set to skb if no route is found.
-		 */
-		if (rt6 && rt6->rt6i_idev)
+		if (rt6)
 			dev = rt6->rt6i_idev->dev;
 	}
 
@@ -930,7 +927,7 @@ static int icmpv6_rcv(struct sk_buff *skb)
 		break;
 	case ICMPV6_EXT_ECHO_REQUEST:
 		if (!net->ipv6.sysctl.icmpv6_echo_ignore_all &&
-		    READ_ONCE(net->ipv4.sysctl_icmp_echo_enable_probe))
+		    net->ipv4.sysctl_icmp_echo_enable_probe)
 			icmpv6_echo_reply(skb);
 		break;
 

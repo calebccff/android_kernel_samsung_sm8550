@@ -48,10 +48,10 @@
  * for all hugepage allocations.
  */
 unsigned long transparent_hugepage_flags __read_mostly =
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS) || defined(CONFIG_HUGEPAGE_POOL)
 	(1<<TRANSPARENT_HUGEPAGE_FLAG)|
 #endif
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE_MADVISE) && !defined(CONFIG_HUGEPAGE_POOL)
 	(1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG)|
 #endif
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG)|
@@ -593,8 +593,13 @@ out:
 }
 EXPORT_SYMBOL_GPL(thp_get_unmapped_area);
 
+#ifdef CONFIG_HUGEPAGE_POOL
+static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+			struct page *page, gfp_t gfp, bool need_clear)
+#else
 static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
 			struct page *page, gfp_t gfp)
+#endif
 {
 	struct vm_area_struct *vma = vmf->vma;
 	pgtable_t pgtable;
@@ -617,7 +622,12 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
 		goto release;
 	}
 
+#ifdef CONFIG_HUGEPAGE_POOL
+	if (need_clear)
+		clear_huge_page(page, vmf->address, HPAGE_PMD_NR);
+#else
 	clear_huge_page(page, vmf->address, HPAGE_PMD_NR);
+#endif
 	/*
 	 * The memory barrier inside __SetPageUptodate makes sure that
 	 * clear_huge_page writes become visible before the set_pmd_at()
@@ -774,13 +784,21 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 		return ret;
 	}
 	gfp = vma_thp_gfp_mask(vma);
+#ifdef CONFIG_HUGEPAGE_POOL
+	page = alloc_from_hugepage_pool(gfp, vma, haddr, HPAGE_PMD_ORDER);
+#else
 	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+#endif
 	if (unlikely(!page)) {
 		count_vm_event(THP_FAULT_FALLBACK);
 		return VM_FAULT_FALLBACK;
 	}
 	prep_transhuge_page(page);
+#ifdef CONFIG_HUGEPAGE_POOL
+	return __do_huge_pmd_anonymous_page(vmf, page, gfp, false);
+#else
 	return __do_huge_pmd_anonymous_page(vmf, page, gfp);
+#endif
 }
 
 static void insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
@@ -1720,20 +1738,17 @@ bool move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
  *      or if prot_numa but THP migration is not supported
  *  - HPAGE_PMD_NR if protections changed and TLB flush necessary
  */
-int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
-		    pmd_t *pmd, unsigned long addr, pgprot_t newprot,
-		    unsigned long cp_flags)
+int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+		unsigned long addr, pgprot_t newprot, unsigned long cp_flags)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	spinlock_t *ptl;
-	pmd_t oldpmd, entry;
+	pmd_t entry;
 	bool preserve_write;
 	int ret;
 	bool prot_numa = cp_flags & MM_CP_PROT_NUMA;
 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
 	bool uffd_wp_resolve = cp_flags & MM_CP_UFFD_WP_RESOLVE;
-
-	tlb_change_page_size(tlb, HPAGE_PMD_SIZE);
 
 	if (prot_numa && !thp_migration_supported())
 		return 1;
@@ -1798,12 +1813,12 @@ int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	 * The race makes MADV_DONTNEED miss the huge pmd and don't clear it
 	 * which may break userspace.
 	 *
-	 * pmdp_invalidate_ad() is required to make sure we don't miss
+	 * pmdp_invalidate() is required to make sure we don't miss
 	 * dirty/young flags set by hardware.
 	 */
-	oldpmd = pmdp_invalidate_ad(vma, addr, pmd);
+	entry = pmdp_invalidate(vma, addr, pmd);
 
-	entry = pmd_modify(oldpmd, newprot);
+	entry = pmd_modify(entry, newprot);
 	if (preserve_write)
 		entry = pmd_mk_savedwrite(entry);
 	if (uffd_wp) {
@@ -1819,10 +1834,6 @@ int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	}
 	ret = HPAGE_PMD_NR;
 	set_pmd_at(mm, addr, pmd, entry);
-
-	if (huge_pmd_needs_flush(oldpmd, entry))
-		tlb_flush_pmd_range(tlb, addr, HPAGE_PMD_SIZE);
-
 	BUG_ON(vma_is_anonymous(vma) && !preserve_write && pmd_write(entry));
 unlock:
 	spin_unlock(ptl);
@@ -1933,7 +1944,7 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	pgtable_t pgtable;
-	pmd_t _pmd, old_pmd;
+	pmd_t _pmd;
 	int i;
 
 	/*
@@ -1944,7 +1955,7 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 	 *
 	 * See Documentation/vm/mmu_notifier.rst
 	 */
-	old_pmd = pmdp_huge_clear_flush(vma, haddr, pmd);
+	pmdp_huge_clear_flush(vma, haddr, pmd);
 
 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
 	pmd_populate(mm, &_pmd, pgtable);
@@ -1953,8 +1964,6 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
 		pte_t *pte, entry;
 		entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
 		entry = pte_mkspecial(entry);
-		if (pmd_uffd_wp(old_pmd))
-			entry = pte_mkuffd_wp(entry);
 		pte = pte_offset_map(&_pmd, haddr);
 		VM_BUG_ON(!pte_none(*pte));
 		set_pte_at(mm, haddr, pte, entry);
@@ -2801,9 +2810,6 @@ void deferred_split_huge_page(struct page *page)
 	if (PageSwapCache(page))
 		return;
 
-	if (!list_empty(page_deferred_list(page)))
-		return;
-
 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
 	if (list_empty(page_deferred_list(page))) {
 		count_vm_event(THP_DEFERRED_SPLIT_PAGE);
@@ -2905,15 +2911,14 @@ static void split_huge_pages_all(void)
 	unsigned long total = 0, split = 0;
 
 	pr_debug("Split all THPs\n");
-	for_each_zone(zone) {
-		if (!managed_zone(zone))
-			continue;
+	for_each_populated_zone(zone) {
 		max_zone_pfn = zone_end_pfn(zone);
 		for (pfn = zone->zone_start_pfn; pfn < max_zone_pfn; pfn++) {
-			int nr_pages;
+			if (!pfn_valid(pfn))
+				continue;
 
-			page = pfn_to_online_page(pfn);
-			if (!page || !get_page_unless_zero(page))
+			page = pfn_to_page(pfn);
+			if (!get_page_unless_zero(page))
 				continue;
 
 			if (zone != page_zone(page))
@@ -2924,10 +2929,8 @@ static void split_huge_pages_all(void)
 
 			total++;
 			lock_page(page);
-			nr_pages = thp_nr_pages(page);
 			if (!split_huge_page(page))
 				split++;
-			pfn += nr_pages - 1;
 			unlock_page(page);
 next:
 			put_page(page);

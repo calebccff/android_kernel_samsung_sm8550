@@ -1384,11 +1384,8 @@ int __ref add_memory_resource(int nid, struct resource *res, mhp_t mhp_flags)
 
 	mem_hotplug_begin();
 
-	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK)) {
-		ret = memblock_add_node(start, size, nid, MEMBLOCK_NONE);
-		if (ret)
-			goto error_mem_hotplug_end;
-	}
+	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
+		memblock_add_node(start, size, nid);
 
 	ret = __try_online_node(nid, false);
 	if (ret < 0)
@@ -1461,7 +1458,6 @@ error:
 		rollback_node_hotadd(nid);
 	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
 		memblock_remove(start, size);
-error_mem_hotplug_end:
 	mem_hotplug_done();
 	return ret;
 }
@@ -1516,25 +1512,17 @@ int add_memory_subsection(int nid, u64 start, u64 size)
 	nid = memory_add_physaddr_to_nid(start);
 
 	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
-		memblock_add_node(start, size, nid, MEMBLOCK_NONE);
+		memblock_add_node(start, size, nid);
 
 	ret = arch_add_memory(nid, start, size, &params);
 	if (ret) {
+		if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
+			memblock_remove(start, size);
 		pr_err("%s failed to add subsection start 0x%llx size 0x%llx\n",
 			   __func__, start, size);
-		goto err_add_memory;
 	}
 	mem_hotplug_done();
 
-	return ret;
-
-err_add_memory:
-	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
-		memblock_remove(start, size);
-
-	mem_hotplug_done();
-
-	release_memory_resource(res);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(add_memory_subsection);
@@ -1726,7 +1714,7 @@ static int scan_movable_pages(unsigned long start, unsigned long end,
 		 */
 		if (HPageMigratable(head))
 			goto found;
-		skip = compound_nr(head) - (pfn - page_to_pfn(head));
+		skip = compound_nr(head) - (page - head);
 		pfn += skip - 1;
 	}
 	return -ENOENT;
@@ -1753,7 +1741,7 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
 
 		if (PageHuge(page)) {
 			pfn = page_to_pfn(head) + compound_nr(head) - 1;
-			isolate_hugetlb(head, &source);
+			isolate_huge_page(head, &source);
 			continue;
 		} else if (PageTransHuge(page))
 			pfn = page_to_pfn(head) + thp_nr_pages(page) - 1;

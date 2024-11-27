@@ -53,18 +53,16 @@ static inline bool exit_must_hard_disable(void)
  */
 static notrace __always_inline bool prep_irq_for_enabled_exit(bool restartable)
 {
-	bool must_hard_disable = (exit_must_hard_disable() || !restartable);
-
 	/* This must be done with RI=1 because tracing may touch vmaps */
 	trace_hardirqs_on();
 
-	if (must_hard_disable)
+	if (exit_must_hard_disable() || !restartable)
 		__hard_EE_RI_disable();
 
 #ifdef CONFIG_PPC64
 	/* This pattern matches prep_irq_for_idle */
 	if (unlikely(lazy_irq_pending_nocheck())) {
-		if (must_hard_disable) {
+		if (exit_must_hard_disable() || !restartable) {
 			local_paca->irq_happened |= PACA_IRQ_HARD_DIS;
 			__hard_RI_enable();
 		}
@@ -82,6 +80,8 @@ notrace long system_call_exception(long r3, long r4, long r5,
 				   unsigned long r0, struct pt_regs *regs)
 {
 	syscall_fn f;
+
+	kuep_lock();
 
 	regs->orig_gpr3 = r3;
 
@@ -406,6 +406,7 @@ again:
 
 	/* Restore user access locks last */
 	kuap_user_restore(regs);
+	kuep_unlock();
 
 	return ret;
 }
@@ -528,6 +529,7 @@ void preempt_schedule_irq(void);
 
 notrace unsigned long interrupt_exit_kernel_prepare(struct pt_regs *regs)
 {
+	unsigned long flags;
 	unsigned long ret = 0;
 	unsigned long kuap;
 	bool stack_store = current_thread_info()->flags &
@@ -544,7 +546,7 @@ notrace unsigned long interrupt_exit_kernel_prepare(struct pt_regs *regs)
 
 	kuap = kuap_get_and_assert_locked();
 
-	local_irq_disable();
+	local_irq_save(flags);
 
 	if (!arch_irq_disabled_regs(regs)) {
 		/* Returning to a kernel context with local irqs enabled. */
